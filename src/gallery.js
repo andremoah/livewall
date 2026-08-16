@@ -1,3 +1,4 @@
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const vscode = require('vscode');
@@ -20,19 +21,16 @@ function humanSize(bytes) {
   return mb >= 1 ? mb.toFixed(1) + ' MB' : Math.round(bytes / 1024) + ' KB';
 }
 
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) => (
-    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
-  ));
-}
-
 function renderHtml(webview) {
+  // A nonce rather than blanket 'unsafe-inline': the page has exactly one script and it is
+  // ours, so there is no reason to allow any other.
+  const nonce = crypto.randomBytes(16).toString('base64');
   const csp = [
     `default-src 'none'`,
     `img-src ${webview.cspSource} https: data:`,
     `media-src ${webview.cspSource} https:`,
     `style-src 'unsafe-inline'`,
-    `script-src 'unsafe-inline'`,
+    `script-src 'nonce-${nonce}'`,
   ].join('; ');
 
   return `<!DOCTYPE html>
@@ -75,7 +73,7 @@ function renderHtml(webview) {
       <option value="pixabay">Pixabay — video</option>
       <option value="pexels">Pexels — video</option>
       <option value="wallhaven-anime">Wallhaven — anime</option>
-      <option value="wallhaven">Wallhaven — tudo</option>
+      <option value="wallhaven">Wallhaven — everything</option>
       <option value="local">My library</option>
     </select>
     <input id="q" type="search" placeholder="Search… (e.g. neon, rain, lofi)">
@@ -88,7 +86,7 @@ function renderHtml(webview) {
   <div class="grid" id="grid"></div>
   <footer id="credits"></footer>
 
-<script>
+<script nonce="${nonce}">
   const api = acquireVsCodeApi();
   const grid = document.getElementById('grid');
   const statusEl = document.getElementById('status');
@@ -96,7 +94,7 @@ function renderHtml(webview) {
   const sourceEl = document.getElementById('source');
 
   function search() {
-    statusEl.textContent = 'A pesquisar…';
+    statusEl.textContent = 'Searching…';
     grid.replaceChildren();
     api.postMessage({ type: 'search', source: sourceEl.value, query: qEl.value });
   }
@@ -135,9 +133,13 @@ function renderHtml(webview) {
       const thumb = document.createElement('div');
       thumb.className = 'thumb';
       if (item.preview && item.kind === 'video' && item.local) {
+        // Plays on hover only. Autoplaying every tile meant a 60-file library decoded 60
+        // videos at once, in the extension whose whole pitch is decode cost.
         const v = document.createElement('video');
         v.src = item.preview; v.muted = true; v.loop = true;
-        v.autoplay = true; v.setAttribute('playsinline', '');
+        v.preload = 'metadata'; v.setAttribute('playsinline', '');
+        card.addEventListener('mouseenter', () => { v.play().catch(() => {}); });
+        card.addEventListener('mouseleave', () => { v.pause(); });
         thumb.appendChild(v);
       } else if (item.preview) {
         const img = document.createElement('img');
@@ -187,7 +189,7 @@ function renderHtml(webview) {
       card.append(thumb, meta);
 
       const pick = () => {
-        statusEl.textContent = 'Downloading…';
+        statusEl.textContent = item.local ? 'Applying…' : 'Downloading…';
         api.postMessage({ type: 'pick', item });
       };
       card.addEventListener('click', pick);
@@ -204,25 +206,49 @@ function renderHtml(webview) {
 </body></html>`;
 }
 
+/** One gallery at a time - running the command twice used to open a second, competing panel. */
+let panel = null;
+
 function open(context, onPick) {
   const cfg = () => vscode.workspace.getConfiguration('livewall');
-  const downloadDir = path.join(context.globalStorageUri.fsPath, 'wallpapers');
+  const libraryDir = () => expandHome((cfg().get('library') || '').trim());
 
-  const panel = vscode.window.createWebviewPanel(
+  if (panel) {
+    panel.reveal(vscode.ViewColumn.Active);
+    return;
+  }
+
+  // Scoped to the folders the gallery actually previews. It used to include the whole home
+  // directory, which let the webview read any file the user owns.
+  const roots = [context.globalStorageUri];
+  const lib = libraryDir();
+  if (lib) roots.push(vscode.Uri.file(lib));
+
+  panel = vscode.window.createWebviewPanel(
     'livewall.gallery',
     'LiveWall',
     vscode.ViewColumn.Active,
-    {
-      enableScripts: true,
-      retainContextWhenHidden: true,
-      localResourceRoots: [context.globalStorageUri, vscode.Uri.file(require('node:os').homedir())],
-    }
+    { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: roots }
   );
-  context.subscriptions.push(panel);
-  panel.webview.html = renderHtml(panel.webview);
+  const self = panel;
+  self.onDidDispose(() => { if (panel === self) panel = null; });
+  context.subscriptions.push(self);
+  self.webview.html = renderHtml(self.webview);
 
-  const post = (msg) => panel.webview.postMessage(msg);
+  const post = (msg) => self.webview.postMessage(msg);
   const currentPath = () => expandHome((cfg().get('media') || cfg().get('video') || '').trim());
+
+  /** Downloads land in the library when there is one, so shuffle can actually see them. */
+  const downloadDir = () => {
+    const dir = libraryDir();
+    if (dir) {
+      try {
+        fs.mkdirSync(dir, { recursive: true });
+        return dir;
+      } catch {}
+    }
+    return path.join(context.globalStorageUri.fsPath, 'wallpapers');
+  };
 
   async function runSearch(source, query) {
     try {
@@ -234,7 +260,7 @@ function open(context, onPick) {
           kind: f.kind,
           local: true,
           localPath: f.path,
-          preview: panel.webview.asWebviewUri(vscode.Uri.file(f.path)).toString(),
+          preview: self.webview.asWebviewUri(vscode.Uri.file(f.path)).toString(),
           current: f.path === currentPath(),
         }));
         post({ type: 'results', items, note: dir || 'set livewall.library to a folder' });
@@ -253,7 +279,7 @@ function open(context, onPick) {
         type: 'results',
         note: source.startsWith('wallhaven')
           ? 'Wallhaven — still images'
-          : `${found[0] ? found[0].source : ''} — video, downloaded when you pick it`,
+          : 'video, downloaded when you pick it',
         credit: PROVIDERS[source] ? PROVIDERS[source].credit : '',
         items: found.map((r) => ({
           name: r.author || r.label,
@@ -307,7 +333,7 @@ function open(context, onPick) {
     }
   }
 
-  panel.webview.onDidReceiveMessage(async (msg) => {
+  self.webview.onDidReceiveMessage(async (msg) => {
     if (msg.type === 'search') {
       runSearch(msg.source, msg.query);
       return;
@@ -332,7 +358,7 @@ function open(context, onPick) {
     }
 
     if (msg.type === 'folder') {
-      const dir = expandHome((cfg().get('library') || '').trim());
+      const dir = libraryDir();
       if (!dir) {
         const picked = await vscode.window.showOpenDialog({
           canSelectFolders: true,
@@ -342,6 +368,9 @@ function open(context, onPick) {
         });
         if (picked && picked[0]) {
           await cfg().update('library', picked[0].fsPath, vscode.ConfigurationTarget.Global);
+          // The panel's resource roots are fixed at creation, so it has to come back to
+          // preview files from a library that did not exist when it opened.
+          post({ type: 'status', text: 'Library set. Reopen the gallery to preview it.' });
           vscode.env.openExternal(picked[0]);
         }
         return;
@@ -374,7 +403,7 @@ function open(context, onPick) {
         { location: vscode.ProgressLocation.Notification, title: 'LiveWall: downloading…' },
         (progress) => {
           let last = 0;
-          return sources.download(msg.item.remote, downloadDir, (ratio) => {
+          return sources.download(msg.item.remote, downloadDir(), (ratio) => {
             progress.report({ increment: (ratio - last) * 100 });
             last = ratio;
           });

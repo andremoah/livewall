@@ -1,5 +1,9 @@
+node_modules/
+.gitignore
+*.vsix
+.DS_Store
 test/**
+.github/**
 media/*.svg
 media/screenshots/**
-*.vsix
 .vscodeignore

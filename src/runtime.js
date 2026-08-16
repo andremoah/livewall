@@ -5,6 +5,12 @@
  * promoted to its own compositor layer. That is the whole point over CSS-background
  * approaches: decoding stays off the main thread and editor repaints never rerasterize it.
  *
+ * The script carries no configuration. Everything it needs it fetches from a small JSON
+ * file the extension rewrites on every settings change, and re-polls a couple of times a
+ * second. That indirection is what makes opacity, scrim, speed, the on/off toggle and even
+ * the wallpaper itself change live - patching workbench.html per change would mean a window
+ * reload every time, which is why those settings used to be untunable in practice.
+ *
  * The two media kinds are not equivalent. A <video> can be paused, throttled and rate
  * limited; an animated gif/webp is driven by the browser and exposes no playback API, so
  * `video` is null for those and every playback call has to be guarded.
@@ -12,9 +18,15 @@
  * CSP notes for VS Code 1.13x:
  *   - `require-trusted-types-for 'script'` is active, so no innerHTML anywhere below.
  *   - `media-src 'self'` means media must be same-origin: vscode-file://vscode-app/<abs path>.
+ *   - `connect-src 'self'` already covers fetching the state file from that same origin,
+ *     so the live channel costs no extra CSP relaxation.
  */
-function buildCss(cfg) {
-  return `
+
+/**
+ * Static, so nothing user-controlled is ever interpolated into the injected markup. The two
+ * values that do change ride in as custom properties the extension updates at runtime.
+ */
+const CSS = `
 html, body { background: transparent !important; }
 
 #livewall-media {
@@ -25,7 +37,7 @@ html, body { background: transparent !important; }
   object-fit: cover;
   z-index: 0;
   pointer-events: none;
-  opacity: ${cfg.opacity};
+  opacity: var(--livewall-opacity, 0.35);
   /* own compositor layer - keeps editor repaints off the wallpaper */
   will-change: transform;
   transform: translateZ(0);
@@ -36,7 +48,7 @@ html, body { background: transparent !important; }
   inset: 0;
   z-index: 1;
   pointer-events: none;
-  background: rgba(0, 0, 0, ${cfg.scrim});
+  background: rgba(0, 0, 0, var(--livewall-scrim, 0.55));
 }
 
 .monaco-workbench {
@@ -94,31 +106,29 @@ html, body { background: transparent !important; }
   background-color: var(--vscode-editorWidget-background) !important;
 }
 `.trim();
-}
 
-function buildScript(cfg) {
-  // A playlist rotates entirely inside the renderer. Re-patching workbench.html per change
-  // would mean a window reload every rotation, which is unusable.
-  const playlist = cfg.playlist && cfg.playlist.length
-    ? cfg.playlist
-    : [{ src: cfg.src, kind: cfg.kind }];
+const DEFAULT_POLL_MS = 1500;
 
+/**
+ * @param {{stateUrl: string, pollMs?: number}} opts
+ */
+function buildScript(opts) {
+  // JSON.stringify does not escape `<`, so a value containing `</script>` would close the
+  // tag we are writing into. Nothing user-controlled reaches this payload any more, but the
+  // escape stays: it is the difference between "safe" and "safe as long as nobody adds a
+  // field here later".
   const payload = JSON.stringify({
-    playlist,
-    shuffle: !!cfg.shuffle,
-    rotateMs: Math.max(0, Number(cfg.rotateMinutes) || 0) * 60 * 1000,
-    rate: cfg.playbackRate,
-    pauseOnBlur: cfg.pauseOnBlur,
-    respectReducedMotion: cfg.respectReducedMotion,
-    css: buildCss(cfg),
-  });
+    stateUrl: opts.stateUrl,
+    pollMs: opts.pollMs || DEFAULT_POLL_MS,
+    css: CSS,
+  }).replace(/</g, '\\u003c');
 
   // Kept deliberately dependency-free and defensive: this runs inside VS Code's own renderer.
   return `(function () {
   var CFG = ${payload};
 
   function boot() {
-    if (document.getElementById('livewall-media')) return;
+    if (document.getElementById('livewall-scrim')) return;
 
     var style = document.createElement('style');
     style.id = 'livewall-style';
@@ -129,9 +139,54 @@ function buildScript(cfg) {
     scrim.id = 'livewall-scrim';
     document.body.insertBefore(scrim, document.body.firstChild);
 
+    var state = null;   // last configuration read from disk
     var video = null;   // null whenever the current item is an image
     var media = null;
-    var index = CFG.shuffle ? Math.floor(Math.random() * CFG.playlist.length) : 0;
+    var index = 0;
+    var rotTimer = null;
+    var errors = 0;     // consecutive load failures, to stop a broken playlist spinning
+
+    var reducedMotion = false;
+    try {
+      reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    } catch (e) {}
+
+    // Tracked from real blur/focus events rather than document.hasFocus(): during workbench
+    // startup hasFocus() can be false while the window is genuinely focused, and no focus
+    // event ever follows, which would strand a video paused on frame 1 forever.
+    var blurred = false;
+
+    function playlist() { return (state && state.playlist) || []; }
+    function enabled() { return !!(state && state.enabled && playlist().length); }
+    function reduced() { return reducedMotion && !!(state && state.respectReducedMotion); }
+
+    var diag = {
+      lastError: null,
+      lastStateError: null,
+      playRejected: null,
+      lastBlurReason: null,
+      media: null,
+      video: null,
+      get stamp() { return state && state.stamp; },
+      get kind() { return (playlist()[index] || {}).kind; },
+      get playlist() { return playlist().length; },
+      get index() { return index; },
+      get enabled() { return enabled(); },
+      get reducedMotion() { return reduced(); },
+      get blurred() { return blurred; },
+      get hidden() { return document.hidden; },
+      get state() {
+        if (!state) return 'waiting: no state file yet';
+        if (!state.enabled) return 'off: disabled';
+        if (!playlist().length) return 'off: no wallpaper set';
+        if (!video) return 'image: always animating';
+        return reduced() ? 'blocked: prefers-reduced-motion'
+          : document.hidden ? 'paused: window hidden'
+          : (state.pauseOnBlur && blurred) ? 'paused: window blurred'
+          : video.paused ? 'paused: unknown' : 'playing';
+      },
+    };
+    window.__livewall = diag;
 
     function build(item) {
       var el;
@@ -158,11 +213,18 @@ function buildScript(cfg) {
     }
 
     function applyRate() {
-      if (!video) return;
-      try { video.playbackRate = CFG.rate; } catch (e) {}
+      if (!video || !state) return;
+      try { video.playbackRate = state.rate; } catch (e) {}
+    }
+
+    function onLoaded() {
+      errors = 0;
+      applyRate();
+      sync();
     }
 
     function mount(item) {
+      if (!item) return;
       var next = build(item);
       if (media && media.parentNode) media.parentNode.replaceChild(next, media);
       else document.body.insertBefore(next, document.body.firstChild);
@@ -170,65 +232,46 @@ function buildScript(cfg) {
 
       if (video) {
         video.addEventListener('loadedmetadata', applyRate);
-        video.addEventListener('canplay', sync);
-        video.addEventListener('loadeddata', sync);
+        video.addEventListener('canplay', onLoaded);
+        video.addEventListener('loadeddata', onLoaded);
+      } else {
+        media.addEventListener('load', onLoaded);
       }
       media.addEventListener('error', onMediaError);
-      if (diag) { diag.media = media; diag.video = video; diag.kind = item.kind; }
+      diag.media = media;
+      diag.video = video;
       applyRate();
       sync();
     }
 
+    function unmount() {
+      if (media && media.parentNode) media.parentNode.removeChild(media);
+      // Drop the source too, or a hidden <video> keeps its decoder alive.
+      if (media) { try { media.removeAttribute('src'); } catch (e) {} }
+      media = null;
+      video = null;
+      diag.media = null;
+      diag.video = null;
+    }
+
     function rotate() {
-      if (CFG.playlist.length < 2) return;
-      index = CFG.shuffle
+      var list = playlist();
+      if (list.length < 2) return;
+      index = state.shuffle
         // Re-roll on a repeat so the same wallpaper does not appear twice in a row.
         ? (function () {
-            var n = Math.floor(Math.random() * CFG.playlist.length);
-            return n === index ? (n + 1) % CFG.playlist.length : n;
+            var n = Math.floor(Math.random() * list.length);
+            return n === index ? (n + 1) % list.length : n;
           })()
-        : (index + 1) % CFG.playlist.length;
-      mount(CFG.playlist[index]);
+        : (index + 1) % list.length;
+      mount(list[index]);
     }
-
-    var reduced = false;
-    if (CFG.respectReducedMotion) {
-      try {
-        reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-      } catch (e) {}
-    }
-
-    // Tracked from real blur/focus events rather than document.hasFocus(): during workbench
-    // startup hasFocus() can be false while the window is genuinely focused, and no focus
-    // event ever follows, which would strand a video paused on frame 1 forever.
-    var blurred = false;
-
-    var diag = {
-      lastError: null,
-      playRejected: null,
-      lastBlurReason: null,
-      kind: CFG.playlist[index] && CFG.playlist[index].kind,
-      media: media,
-      video: video,
-      playlist: CFG.playlist.length,
-      get index() { return index; },
-      reducedMotion: reduced,
-      get blurred() { return blurred; },
-      get hidden() { return document.hidden; },
-      get state() {
-        if (!video) return 'image: always animating';
-        return reduced ? 'blocked: prefers-reduced-motion'
-          : document.hidden ? 'paused: window hidden'
-          : (CFG.pauseOnBlur && blurred) ? 'paused: window blurred'
-          : video.paused ? 'paused: unknown' : 'playing';
-      },
-    };
-    window.__livewall = diag;
 
     function shouldPlay() {
-      if (reduced) return false;
+      if (!enabled()) return false;
+      if (reduced()) return false;
       if (document.hidden) return false;
-      if (CFG.pauseOnBlur && blurred) return false;
+      if (state.pauseOnBlur && blurred) return false;
       return true;
     }
 
@@ -248,13 +291,77 @@ function buildScript(cfg) {
     }
 
     function onMediaError() {
-      var item = CFG.playlist[index] || {};
+      var item = playlist()[index] || {};
       diag.lastError = (video && video.error)
         ? video.error.code + ' ' + video.error.message
         : 'failed to load';
       console.warn('[livewall] media error:', diag.lastError, item.src);
-      // A deleted or corrupt file must not strand the wallpaper on a broken item.
-      if (CFG.playlist.length > 1) rotate();
+
+      // A deleted or corrupt file must not strand the wallpaper on a broken item - but a
+      // whole playlist of broken items must not spin either, so give up after one pass.
+      errors++;
+      if (playlist().length > 1 && errors < playlist().length) rotate();
+      else if (errors >= playlist().length) {
+        console.warn('[livewall] every wallpaper failed to load, giving up until settings change');
+      }
+    }
+
+    function restartRotation() {
+      if (rotTimer) { clearInterval(rotTimer); rotTimer = null; }
+      if (!state || !(state.rotateMs > 0) || playlist().length < 2) return;
+      rotTimer = setInterval(function () {
+        // Rotating while the window is hidden burns decode on frames nobody sees.
+        if (!document.hidden && enabled()) rotate();
+      }, state.rotateMs);
+    }
+
+    function srcsOf(s) {
+      return ((s && s.playlist) || []).map(function (i) { return i.src; }).join('\\n');
+    }
+
+    function applyState(next) {
+      var prev = state;
+      state = next;
+
+      var root = document.documentElement;
+      if (root && root.style && root.style.setProperty) {
+        root.style.setProperty('--livewall-opacity', String(next.opacity));
+        root.style.setProperty('--livewall-scrim', String(next.scrim));
+      }
+      scrim.style.display = enabled() ? '' : 'none';
+
+      if (!enabled()) {
+        unmount();
+        restartRotation();
+        return;
+      }
+
+      // Only remount when the wallpapers themselves changed. Dragging the opacity slider
+      // must not restart the video.
+      if (!media || !prev || srcsOf(prev) !== srcsOf(next)) {
+        index = next.shuffle ? Math.floor(Math.random() * next.playlist.length) : 0;
+        errors = 0;
+        mount(next.playlist[index]);
+      } else {
+        applyRate();
+        sync();
+      }
+      restartRotation();
+    }
+
+    function poll() {
+      if (typeof fetch !== 'function') return;
+      fetch(CFG.stateUrl + '?t=' + Date.now(), { cache: 'no-store' })
+        .then(function (res) {
+          if (!res.ok) throw new Error('state ' + res.status);
+          return res.json();
+        })
+        .then(function (next) {
+          if (!next || (state && next.stamp === state.stamp)) return;
+          diag.lastStateError = null;
+          applyState(next);
+        })
+        .catch(function (err) { diag.lastStateError = String(err); });
     }
 
     // Webview panels (Copilot, chat, notebook renderers) are iframes, and VS Code runs them
@@ -291,8 +398,12 @@ function buildScript(cfg) {
       clearTimeout(blurTimer);
       blurred = false;
       sync();
+      poll();   // catch up immediately on anything changed while we were away
     });
-    document.addEventListener('visibilitychange', sync);
+    document.addEventListener('visibilitychange', function () {
+      sync();
+      if (!document.hidden) poll();
+    });
 
     // If autoplay is ever refused, the first real interaction is a valid gesture to retry on.
     document.addEventListener('pointerdown', function retry() {
@@ -301,14 +412,11 @@ function buildScript(cfg) {
     });
 
     diag.rotate = rotate;
-    mount(CFG.playlist[index]);
+    diag.poll = poll;
+    diag.apply = applyState;
 
-    if (CFG.rotateMs > 0 && CFG.playlist.length > 1) {
-      setInterval(function () {
-        // Rotating while the window is hidden burns decode on frames nobody sees.
-        if (!document.hidden) rotate();
-      }, CFG.rotateMs);
-    }
+    poll();
+    setInterval(function () { if (!document.hidden) poll(); }, CFG.pollMs);
   }
 
   if (document.body) boot();
@@ -316,4 +424,4 @@ function buildScript(cfg) {
 })();`;
 }
 
-module.exports = { buildScript };
+module.exports = { buildScript, CSS, DEFAULT_POLL_MS };

@@ -1,5 +1,8 @@
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
+const { Readable } = require('node:stream');
+const { pipeline } = require('node:stream/promises');
 
 /**
  * Remote wallpaper sources.
@@ -114,8 +117,20 @@ function parse(source, body) {
   }));
 }
 
+// Hashed whole rather than truncated: a base64 prefix meant two long queries could share a
+// cache entry and silently return each other's results.
 function cacheKey(source, query) {
-  return source + '_' + Buffer.from(query || '').toString('base64url').slice(0, 60);
+  return source + '_' + crypto.createHash('sha1').update(query || '').digest('hex');
+}
+
+/** Nothing here is worth keeping past its TTL, and the folder used to grow forever. */
+function prune(dir) {
+  try {
+    for (const f of fs.readdirSync(dir)) {
+      const p = path.join(dir, f);
+      if (Date.now() - fs.statSync(p).mtimeMs > CACHE_TTL_MS) fs.unlinkSync(p);
+    }
+  } catch {}
 }
 
 /** Local disk cache. Pixabay's terms require 24h caching; it also keeps us far under every limit. */
@@ -133,6 +148,7 @@ async function cached(dir, source, query, fetcher) {
   try {
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(file, JSON.stringify(fresh), 'utf-8');
+    prune(dir);
   } catch {}
   return fresh;
 }
@@ -163,28 +179,51 @@ async function search(source, query, opts = {}) {
   return parse(source, body);
 }
 
+const SAFE_EXT = new Set(['.mp4', '.jpg', '.png']);
+
+/**
+ * `id` and `url` are built from a provider's JSON response, so neither is ours. An `id` of
+ * `../../../evil` would have escaped the download folder outright; the filename is reduced
+ * to a single safe component and the URL is pinned to https before anything is fetched.
+ */
+function destinationFor(item, destDir) {
+  const name = path.basename(String(item.id || 'wallpaper')).replace(/[^A-Za-z0-9._-]/g, '_');
+  const ext = SAFE_EXT.has(item.ext) ? item.ext : '.bin';
+  return path.join(destDir, name + ext);
+}
+
 async function download(item, destDir, onProgress) {
+  const url = String(item.url || '');
+  if (!/^https:\/\//i.test(url)) throw new Error('refusing to download from ' + (url || 'nothing'));
+
   fs.mkdirSync(destDir, { recursive: true });
-  const dest = path.join(destDir, `${item.id}${item.ext}`);
+  const dest = destinationFor(item, destDir);
   if (fs.existsSync(dest)) return dest;
 
-  const res = await fetch(item.url, { headers: { 'User-Agent': UA } });
+  const res = await fetch(url, { headers: { 'User-Agent': UA } });
   if (!res.ok) throw new Error(`download ${res.status}`);
 
   const total = Number(res.headers.get('content-length') || 0);
-  const chunks = [];
   let got = 0;
-  for await (const chunk of res.body) {
-    chunks.push(chunk);
+
+  // Streamed to disk rather than buffered: a 4K clip used to sit whole in memory before a
+  // single byte was written.
+  const body = Readable.fromWeb(res.body);
+  body.on('data', (chunk) => {
     got += chunk.length;
     if (onProgress && total) onProgress(got / total);
-  }
+  });
 
   // Temp name first: an interrupted download must not survive as a valid-looking cache hit.
   const tmp = dest + '.part';
-  fs.writeFileSync(tmp, Buffer.concat(chunks));
+  try {
+    await pipeline(body, fs.createWriteStream(tmp));
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch {}
+    throw e;
+  }
   fs.renameSync(tmp, dest);
   return dest;
 }
 
-module.exports = { SOURCES, search, parse, upstream, download };
+module.exports = { SOURCES, search, parse, upstream, download, destinationFor };
