@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="512" height="512">
+  <defs>
+    <linearGradient id="wall" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#8b5cf6"/>
+      <stop offset="0.55" stop-color="#ec4899"/>
+      <stop offset="1" stop-color="#fbbf24"/>
+    </linearGradient>
+    <linearGradient id="scrim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#12101c" stop-opacity="0.38"/>
+      <stop offset="1" stop-color="#12101c" stop-opacity="0.20"/>
+    </linearGradient>
+    <clipPath id="frame">
+      <rect width="128" height="128" rx="28"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#frame)">
+    <!-- the three layers the extension actually builds, in order:
+         wallpaper, scrim, content on top -->
+    <rect width="128" height="128" fill="#12101c"/>
+    <rect width="128" height="128" fill="url(#wall)"/>
+
+    <path d="M0 84 C 22 62, 42 104, 66 82 S 106 58, 128 78 L128 128 L0 128 Z"
+          fill="#12101c" opacity="0.30"/>
+    <path d="M0 102 C 26 84, 46 120, 74 98 S 110 80, 128 96 L128 128 L0 128 Z"
+          fill="#12101c" opacity="0.42"/>
+
+    <rect width="128" height="128" fill="url(#scrim)"/>
+
+    <path d="M34 40 L34 86 L54 86 M68 40 L77 86 L86 62 L95 86 L104 40"
+          fill="none" stroke="#f8fafc" stroke-width="10"
+          stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+
+  <rect x="1.5" y="1.5" width="125" height="125" rx="26.5"
+        fill="none" stroke="#f8fafc" stroke-opacity="0.12" stroke-width="3"/>
+</svg>

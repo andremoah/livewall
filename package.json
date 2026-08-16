@@ -1,0 +1,152 @@
+{
+  "name": "livewall",
+  "displayName": "LiveWall",
+  "description": "Animated video wallpapers behind your code, on their own compositor layer.",
+  "publisher": "andremota",
+  "version": "1.0.0",
+  "license": "MIT",
+  "icon": "media/icon.png",
+  "engines": {
+    "vscode": "^1.120.0"
+  },
+  "categories": [
+    "Themes",
+    "Other"
+  ],
+  "keywords": [
+    "wallpaper",
+    "background",
+    "video",
+    "animated",
+    "theme"
+  ],
+  "galleryBanner": {
+    "color": "#12101c",
+    "theme": "dark"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/andremoah/livewall.git"
+  },
+  "bugs": {
+    "url": "https://github.com/andremoah/livewall/issues"
+  },
+  "homepage": "https://github.com/andremoah/livewall#readme",
+  "sponsor": {
+    "url": "https://buymeacoffee.com/andremota"
+  },
+  "main": "./src/extension.js",
+  "scripts": { "test": "node test/smoke.js" },
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "livewall.choose",
+        "title": "Choose wallpaper...",
+        "category": "LiveWall"
+      },
+      {
+        "command": "livewall.apply",
+        "title": "Apply / re-apply wallpaper",
+        "category": "LiveWall"
+      },
+      {
+        "command": "livewall.remove",
+        "title": "Remove wallpaper and restore VS Code",
+        "category": "LiveWall"
+      }
+    ],
+    "configuration": {
+      "title": "LiveWall",
+      "properties": {
+        "livewall.media": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Absolute path to the wallpaper. Video (`.mp4`, `.webm`, `.mov`) or animated image (`.gif`, `.webp`, `.apng`); still images work too. `~` is supported. Easiest set via **LiveWall: Choose wallpaper...**"
+        },
+        "livewall.library": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Local folder listed under the *My library* source in the gallery, and the folder watched for new files."
+        },
+        "livewall.downloadSites": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "url"],
+            "properties": {
+              "name": { "type": "string" },
+              "url": { "type": "string" }
+            }
+          },
+          "default": [
+            { "name": "Pexels — video", "url": "https://www.pexels.com/videos/" },
+            { "name": "Pixabay — video", "url": "https://pixabay.com/videos/" },
+            { "name": "Coverr — video", "url": "https://coverr.co/" },
+            { "name": "Wallhaven — images", "url": "https://wallhaven.cc/" }
+          ],
+          "markdownDescription": "Sites opened by the **Browse online…** button in the gallery. Opens in your real browser, so downloads work normally; save into `#livewall.library#` and they appear on their own. Add your own freely."
+        },
+        "livewall.shuffle": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Use every file in `#livewall.library#` as a playlist instead of the single file in `#livewall.media#`. New files dropped in the folder are picked up automatically."
+        },
+        "livewall.rotateMinutes": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "markdownDescription": "Minutes between wallpapers when `#livewall.shuffle#` is on. `0` picks one at startup and keeps it."
+        },
+        "livewall.pixabayApiKey": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Free key from [pixabay.com/api/docs](https://pixabay.com/api/docs/) for video search. 100 req/min, 5000 req/h, no monthly cap."
+        },
+        "livewall.pexelsApiKey": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Free key from [pexels.com/api](https://www.pexels.com/api/) for video search. 200 req/h and 20 000 req/month."
+        },
+        "livewall.video": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Deprecated - use `#livewall.media#`. Still read as a fallback."
+        },
+        "livewall.opacity": {
+          "type": "number",
+          "default": 0.35,
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Opacity of the wallpaper layer."
+        },
+        "livewall.scrim": {
+          "type": "number",
+          "default": 0.55,
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Darkening layer between the wallpaper and the UI. Higher = more readable text. This is the readability dial: unlike opacity, it is a fixed sheet, so a bright frame can never blow out your text."
+        },
+        "livewall.playbackRate": {
+          "type": "number",
+          "default": 1,
+          "minimum": 0.1,
+          "maximum": 4,
+          "markdownDescription": "Playback speed. Below `1` is calmer and cheaper. Video only - animated images are driven by the browser and expose no speed control."
+        },
+        "livewall.pauseOnBlur": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Pause when the VS Code window loses focus. Focusing a webview panel does not count as losing focus. Video only - animated images cannot be paused."
+        },
+        "livewall.respectReducedMotion": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Do not animate when the OS requests reduced motion (macOS: Settings > Accessibility > Display > Reduce motion). Set to `false` to animate anyway. Video only - animated images cannot be stopped."
+        }
+      }
+    }
+  }
+}
