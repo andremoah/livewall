@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.2.1
+
+Listing metadata only — no functional change, and no reason to update if you already have
+1.2.0.
+
+- Renamed to **LiveWall — Wallpapers & Backgrounds**. The old title matched nothing anyone
+  searches for; this category is looked up as both "wallpaper" and "background".
+- Search keywords expanded from 5 to 22.
+- Description rewritten to lead with what the extension is rather than how it is built. The
+  compositor-layer argument is still in the README, where there is room to make it.
+
 ## 1.2.0
 
 ### Added

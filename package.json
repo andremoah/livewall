@@ -1,9 +1,9 @@
 {
   "name": "livewall",
-  "displayName": "LiveWall",
-  "description": "Animated video wallpapers behind your code, on their own compositor layer.",
+  "displayName": "LiveWall — Wallpapers & Backgrounds",
+  "description": "Animated video and GIF wallpapers behind your code — smooth, readable, and they pause themselves when you look away.",
   "publisher": "andremota",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "license": "MIT",
   "icon": "media/icon.png",
   "engines": {
@@ -15,10 +15,27 @@
   ],
   "keywords": [
     "wallpaper",
+    "live wallpaper",
+    "animated wallpaper",
     "background",
+    "background image",
+    "custom background",
+    "editor background",
+    "video background",
     "video",
     "animated",
-    "theme"
+    "gif",
+    "webm",
+    "mp4",
+    "theme",
+    "themes",
+    "appearance",
+    "customization",
+    "personalization",
+    "aesthetic",
+    "backdrop",
+    "ambient",
+    "ricing"
   ],
   "galleryBanner": {
     "color": "#12101c",
