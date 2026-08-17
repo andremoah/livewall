@@ -1,20 +1,26 @@
 /**
- * Runs the patcher and the injected runtime against a throwaway copy of the real installed
- * workbench.html. No VS Code process involved, nothing written outside a temp dir.
+ * Runs the patcher, the injected runtime and the extension itself against a committed
+ * workbench.html fixture. No VS Code process involved, nothing written outside a temp dir -
+ * which is the point: the patcher used to self-skip on every CI runner, so the one piece of
+ * code that can stop VS Code from starting was the one piece with no coverage.
  *
  *   node test/smoke.js
+ *
+ * Set LIVEWALL_APP_ROOT to additionally run the patcher against a real installation.
  */
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
+// Before anything that pulls in `vscode`.
+const stub = require('./vscode-stub');
+stub.install();
+
 const patcher = require('../src/patcher');
 const media = require('../src/media');
 const { buildScript } = require('../src/runtime');
 
-const APP_ROOT =
-  process.env.LIVEWALL_APP_ROOT ||
-  '/Applications/Visual Studio Code.app/Contents/Resources/app';
+const FIXTURE = path.join(__dirname, 'fixtures', 'workbench.html');
 const REL = 'out/vs/code/electron-browser/workbench/workbench.html';
 const STAMP = '1.99.0/0.0.0-test';
 const STATE_URL = 'vscode-file://vscode-app/tmp/livewall/state.json';
@@ -152,8 +158,21 @@ for (const f of fs.readdirSync(path.join(__dirname, '..', 'src'))) {
  * than grepping for guards: on the image path `video` is null, so any unguarded video.*
  * call throws here instead of in someone's editor.
  */
-function fakeDom() {
+function fakeDom(opts = {}) {
   const created = [];
+
+  // Held rather than rebuilt per call, so a test can flip the OS setting after boot and see
+  // whether the runtime actually listens.
+  const mq = {
+    matches: !!opts.reducedMotion,
+    listeners: [],
+    addEventListener(t, fn) { this.listeners.push(fn); },
+    fire(v) {
+      this.matches = v;
+      for (const fn of this.listeners.slice()) fn({ matches: v });
+    },
+  };
+
   const make = (tag) => {
     const el = {
       tagName: tag.toUpperCase(),
@@ -185,6 +204,9 @@ function fakeDom() {
       play() { this.paused = false; return Promise.resolve(); },
       paused: true,
     };
+    // Enough of a canvas for the freeze path, and an <img> that reports as decoded.
+    if (tag === 'canvas') el.getContext = () => ({ drawImage() {} });
+    if (tag === 'img') { el.naturalWidth = 1280; el.naturalHeight = 720; }
     created.push(el);
     return el;
   };
@@ -193,9 +215,10 @@ function fakeDom() {
   body.firstChild = null;
   return {
     created,
+    mq,
     window: {
       addEventListener() {},
-      matchMedia: () => ({ matches: false }),
+      matchMedia: () => mq,
       __livewall: null,
     },
     document: {
@@ -229,8 +252,8 @@ function stateOf(over) {
 }
 
 /** Serves whatever `box.state` currently holds, the way the real state file does. */
-function run(script, box) {
-  const dom = fakeDom();
+function run(script, box, opts) {
+  const dom = fakeDom(opts);
   const fetchImpl = () => Promise.resolve({
     ok: box.state !== null,
     status: box.state === null ? 404 : 200,
@@ -373,6 +396,87 @@ async function runtimeTests() {
     check('the failure is reported', !!diag.lastError);
   }
 
+  // Blur, saturation and fit ride in as custom properties, same as opacity and scrim.
+  {
+    const box = { state: stateOf({ filter: 'blur(4px) saturate(0)', fit: 'contain' }) };
+    const r = run(script, box);
+    await tick();
+    const style = r.dom.document.documentElement.style;
+    check('filter applied as a custom property',
+      style['--livewall-filter'] === 'blur(4px) saturate(0)');
+    check('fit applied as a custom property', style['--livewall-fit'] === 'contain');
+
+    box.state = stateOf({ filter: 'none', fit: 'cover', stamp: 's2' });
+    r.diag().poll();
+    await tick();
+    check('filter change is picked up live',
+      r.dom.document.documentElement.style['--livewall-filter'] === 'none');
+  }
+
+  // Regression: reduced motion was read once at boot, so turning it on needed a reload -
+  // the one setting where waiting for a reload is least acceptable.
+  {
+    const box = { state: stateOf({ respectReducedMotion: true }) };
+    const r = run(script, box);
+    await tick();
+    check('video plays while reduced motion is off', r.diag().state === 'playing');
+
+    r.dom.mq.fire(true);
+    check('turning reduced motion on stops the video without a reload',
+      r.diag().state === 'blocked: prefers-reduced-motion');
+    check('the video is actually paused', r.diag().video.paused === true);
+
+    r.dom.mq.fire(false);
+    check('turning it back off resumes', r.diag().state === 'playing');
+  }
+
+  // An animated image has no playback API, so it is held on a captured frame instead. This
+  // is the only way the most expensive wallpaper kind can be stopped at all.
+  {
+    const box = { state: stateOf({
+      playlist: [{ src: 'vscode-file://vscode-app/tmp/a.webp', kind: 'image' }],
+      respectReducedMotion: true,
+    }) };
+    const r = run(script, box);
+    await tick();
+    check('an animated image starts out animating', r.diag().state === 'image: animating');
+    check('nothing is frozen yet', r.diag().frozen === false);
+
+    r.dom.mq.fire(true);
+    check('reduced motion freezes the image', r.diag().frozen === true);
+    check('the frozen state is reported',
+      r.diag().state === 'blocked: prefers-reduced-motion (frozen frame)');
+    check('a freeze canvas was created',
+      r.dom.created.some((e) => e.tagName === 'CANVAS'));
+    check('the image element is hidden behind it',
+      r.diag().media.style.display === 'none');
+
+    r.dom.mq.fire(false);
+    check('clearing reduced motion unfreezes', r.diag().frozen === false);
+    check('the image element is shown again', r.diag().media.style.display === '');
+  }
+
+  // Freezing must survive a rotation from image to video and back.
+  {
+    const box = { state: stateOf({
+      playlist: [
+        { src: 'vscode-file://vscode-app/tmp/a.webp', kind: 'image' },
+        { src: 'vscode-file://vscode-app/tmp/b.mp4', kind: 'video' },
+      ],
+      respectReducedMotion: true,
+    }) };
+    const r = run(script, box, { reducedMotion: true });
+    await tick();
+    const diag = r.diag();
+    check('image starts frozen when reduced motion is already on', diag.frozen === true);
+
+    let err = null;
+    try { diag.rotate(); } catch (e) { err = e.message; }
+    check('rotating away from a frozen image does not throw' + (err ? ': ' + err : ''), !err);
+    check('the freeze is dropped with the image', diag.frozen === false);
+    check('the video is paused instead', diag.video && diag.video.paused === true);
+  }
+
   // No state file yet (first launch before the extension has written one) must not throw.
   {
     const r = run(script, { state: null });
@@ -385,26 +489,31 @@ async function runtimeTests() {
 
 /* ------------------------------------------------------------------ patcher */
 
-async function patcherTests() {
-  const script = buildScript({ stateUrl: STATE_URL });
-
-  const source = path.join(APP_ROOT, REL);
-  if (!fs.existsSync(source)) {
-    console.log(`\nSKIP: no workbench.html at ${source}`);
-    return;
-  }
-
+/**
+ * Lays out a throwaway app root holding `html` at the path the patcher probes for.
+ * @returns {{sandbox: string, target: string}}
+ */
+function makeAppRoot(html) {
   const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'livewall-test-'));
   const target = path.join(sandbox, REL);
   fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(target, html, 'utf-8');
+  return { sandbox, target };
+}
 
-  // Strip any live patch so the fixture is pristine.
-  let original = fs.readFileSync(source, 'utf-8');
-  original = original.replace(/\n?<!-- livewall-start[\s\S]*?<!-- livewall-end -->/g, '');
-  original = original.replace(/\n?<!-- vscode-background-start[\s\S]*?<!-- vscode-background-end -->/g, '');
-  original = original.replace(/script-src 'unsafe-inline'/, 'script-src');
-  original = original.replace(/(media-src\s+'self')\s+vscode-file:/, '$1');
-  fs.writeFileSync(target, original, 'utf-8');
+/** Strips any live patch, so a real installation can be used as a fixture too. */
+function pristine(html) {
+  return html
+    .replace(/\n?<!-- livewall-start[\s\S]*?<!-- livewall-end -->/g, '')
+    .replace(/\n?<!-- vscode-background-start[\s\S]*?<!-- vscode-background-end -->/g, '')
+    .replace(/script-src 'unsafe-inline'/, 'script-src')
+    .replace(/(media-src\s+'self')\s+vscode-file:/, '$1');
+}
+
+async function patcherTests(label, original) {
+  console.log(`\n-- patcher (${label})`);
+  const script = buildScript({ stateUrl: STATE_URL });
+  const { sandbox, target } = makeAppRoot(original);
 
   const r1 = patcher.apply(sandbox, script, STAMP);
   check('apply() ok: ' + (r1.ok ? 'yes' : r1.reason), r1.ok);
@@ -472,11 +581,176 @@ async function patcherTests() {
     check('foreign file restored exactly', after === foreign);
   }
 
+  // Regression: the backup used to be a copy of the file on disk, so if it went missing
+  // while the patch was live, the next re-patch snapshotted the *patched* file as the
+  // pristine one - a restore point that restores a patch.
+  {
+    fs.writeFileSync(target, original, 'utf-8');
+    patcher.apply(sandbox, script, STAMP);
+
+    const bak = patcher.backupPath(target, STAMP);
+    check('backup is the unpatched file', fs.readFileSync(bak, 'utf-8') === original);
+
+    fs.unlinkSync(bak);
+    // An extension update: same VS Code, different stamp, patch still in the file.
+    patcher.apply(sandbox, script, '1.99.0/0.0.1-test');
+    check('a lost backup is rebuilt without the patch in it',
+      !fs.readFileSync(bak, 'utf-8').includes('livewall-start'));
+    check('the rebuilt backup is still the original', fs.readFileSync(bak, 'utf-8') === original);
+
+    patcher.remove(sandbox, STAMP);
+  }
+
+  // The file being written is the application: a torn write leaves VS Code unable to start.
+  {
+    fs.writeFileSync(target, original, 'utf-8');
+    patcher.apply(sandbox, script, STAMP);
+    check('no temp file left beside workbench.html',
+      !fs.existsSync(`${target}.livewall-tmp`));
+    patcher.remove(sandbox, STAMP);
+  }
+
   fs.rmSync(sandbox, { recursive: true, force: true });
 }
 
-runtimeTests()
-  .then(patcherTests)
+/* ------------------------------------------------------------------ extension */
+
+/**
+ * The settings pipeline, end to end: real config in, real workbench.html patched, real
+ * state.json out. Everything VS Code provides comes from the stub.
+ */
+async function extensionTests() {
+  console.log('\n-- extension');
+  const extension = require('../src/extension');
+  const { scheduleMedia, parseClock, filterOf, resolveMedia } = extension;
+
+  check('parseClock reads HH:MM', parseClock('07:30') === 450);
+  check('parseClock accepts a single-digit hour', parseClock('7:30') === 450);
+  check('parseClock rejects nonsense', parseClock('boom') === null);
+  check('parseClock rejects an impossible time',
+    parseClock('24:00') === null && parseClock('10:61') === null);
+
+  const day = [{ from: '07:00', media: '/day.mp4' }, { from: '19:00', media: '/night.mp4' }];
+  const at = (h, m) => new Date(2026, 0, 1, h, m);
+  check('schedule picks the slot in progress', scheduleMedia(day, at(12, 0)) === '/day.mp4');
+  check('schedule picks exactly on the boundary', scheduleMedia(day, at(19, 0)) === '/night.mp4');
+  // Before the first slot the one still running is yesterday's last.
+  check('schedule wraps past midnight', scheduleMedia(day, at(3, 0)) === '/night.mp4');
+  check('empty schedule resolves to nothing', scheduleMedia([], at(12, 0)) === '');
+  check('malformed entries are dropped',
+    scheduleMedia([{ from: 'x', media: '/a' }, { from: '08:00' }], at(12, 0)) === '');
+
+  check('no filters means none', filterOf({ blur: 0, saturate: 1 }) === 'none');
+  check('blur and saturate compose',
+    filterOf({ blur: 4, saturate: 0 }) === 'blur(4px) saturate(0)');
+
+  // A whole activation against a real fixture app root.
+  const { sandbox, target } = makeAppRoot(fs.readFileSync(FIXTURE, 'utf-8'));
+  const homeBox = fs.mkdtempSync(path.join(os.tmpdir(), 'livewall-home-'));
+  const dayFile = path.join(homeBox, 'day.mp4');
+  const nightFile = path.join(homeBox, 'night.mp4');
+  fs.writeFileSync(dayFile, 'x');
+  fs.writeFileSync(nightFile, 'x');
+
+  stub.reset({
+    appRoot: sandbox,
+    settings: { media: dayFile, opacity: 0.5, scrim: 0.4, blur: 3, fit: 'contain' },
+  });
+
+  const context = {
+    subscriptions: [],
+    extension: { packageJSON: { version: '0.0.0-test' } },
+    globalStorageUri: { fsPath: path.join(homeBox, 'storage') },
+  };
+
+  extension.activate(context);
+  await tick();
+  await tick();
+
+  const p = patcher.paths(sandbox);
+  const readState = () => JSON.parse(fs.readFileSync(p.state, 'utf-8'));
+
+  check('activation patches workbench.html',
+    fs.readFileSync(target, 'utf-8').includes('livewall-start'));
+  check('activation writes the state file', fs.existsSync(p.state));
+  check('state carries the chosen wallpaper', readState().playlist.length === 1);
+  check('state carries the clamped opacity', readState().opacity === 0.5);
+  check('blur is compiled into a filter', readState().filter === 'blur(3px)');
+  check('fit is passed through', readState().fit === 'contain');
+  check('status bar shows the wallpaper name',
+    stub.state.statusBar.tooltip.includes('day.mp4'));
+  check('all four commands registered', Object.keys(stub.state.commands).length === 4);
+
+  // The toggle writes the setting; the configuration listener does the rest.
+  await stub.state.commands['livewall.toggle']();
+  await new Promise((r) => setTimeout(r, 250));
+  check('toggle turns it off in the state file', readState().enabled === false);
+  check('status bar reflects the off state', stub.state.statusBar.text.includes('circle-slash'));
+
+  await stub.state.commands['livewall.toggle']();
+  await new Promise((r) => setTimeout(r, 250));
+  check('toggle turns it back on', readState().enabled === true);
+
+  // Regression: the same failure repeated once per slider tick used to raise one toast each.
+  stub.state.settings.media = path.join(homeBox, 'gone.mp4');
+  stub.state.warn = [];
+  stub.fireConfig(['media']);
+  stub.fireConfig(['opacity']);
+  stub.fireConfig(['scrim']);
+  await new Promise((r) => setTimeout(r, 250));
+  check('a repeated failure is reported once, not once per change',
+    stub.state.warn.length === 1);
+
+  // Per-theme wallpapers.
+  stub.state.settings.media = dayFile;
+  stub.state.settings.mediaLight = nightFile;
+  check('dark theme uses the default wallpaper',
+    resolveMedia(extension.readConfig()) === dayFile);
+  stub.fireTheme(1);   // Light
+  check('light theme uses its own wallpaper',
+    resolveMedia(extension.readConfig()) === nightFile);
+  stub.fireTheme(2);
+  check('back to dark restores the default', resolveMedia(extension.readConfig()) === dayFile);
+
+  // Schedule beats both.
+  stub.state.settings.schedule = [{ from: '00:00', media: nightFile }];
+  check('a schedule entry overrides the theme pair',
+    resolveMedia(extension.readConfig()) === nightFile);
+
+  extension.deactivate();
+  for (const d of context.subscriptions) d.dispose();
+  fs.rmSync(sandbox, { recursive: true, force: true });
+  fs.rmSync(homeBox, { recursive: true, force: true });
+}
+
+/* ------------------------------------------------------------------ sources */
+
+function sourceErrorTests() {
+  const { httpError } = require('../src/sources');
+  check('a rejected pixabay key reads as a key problem',
+    httpError('pixabay', 401).message === 'BAD_KEY');
+  // Wallhaven takes no key at all, so its 400 is a bad query.
+  check('a wallhaven 400 is not blamed on a key',
+    httpError('wallhaven', 400).message === 'wallhaven 400');
+  check('429 is a rate limit everywhere', httpError('wallhaven', 429).message === 'RATE_LIMIT');
+}
+
+async function main() {
+  await runtimeTests();
+  sourceErrorTests();
+  await extensionTests();
+
+  await patcherTests('fixture', fs.readFileSync(FIXTURE, 'utf-8'));
+
+  // Optional second pass against a real installation, when one is pointed at.
+  const appRoot = process.env.LIVEWALL_APP_ROOT;
+  const installed = appRoot && path.join(appRoot, REL);
+  if (installed && fs.existsSync(installed)) {
+    await patcherTests('installed', pristine(fs.readFileSync(installed, 'utf-8')));
+  }
+}
+
+main()
   .then(() => {
     console.log(fails === 0 ? '\nALL PASS' : `\n${fails} FAILURE(S)`);
     process.exit(fails === 0 ? 0 : 1);

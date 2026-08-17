@@ -15,7 +15,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
-      # No workbench.html on a runner, so the patcher half self-skips. The runtime, media
-      # and source parsing checks are the ones that catch regressions anyway.
+          # Matches the Node inside the Electron that VS Code 1.13x ships.
+          node-version: 22
+      # Everything runs here now: the patcher works against a committed workbench.html
+      # fixture rather than needing a real installation, which it used to, so the code that
+      # edits the user's VS Code was the one piece with no CI coverage at all.
       - run: node test/smoke.js

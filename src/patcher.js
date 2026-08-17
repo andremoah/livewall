@@ -133,13 +133,35 @@ function backupPath(target, stamp) {
 }
 
 /**
- * Kept as a manual escape hatch: nothing reads it automatically, but a half-written
- * workbench.html would otherwise leave the user reinstalling VS Code. Documented in the
- * README so it is findable when it is needed.
+ * workbench.html *is* the application: a half-written one leaves VS Code unable to start at
+ * all. Content lands under a temp name and is renamed into place, so the file on disk is
+ * only ever the old one or the new one. writeState() already worked this way; the file that
+ * matters more did not.
  */
-function ensureBackup(target, stamp) {
+function writeAtomic(file, content) {
+  const tmp = `${file}.${MARKER}-tmp`;
+  fs.writeFileSync(tmp, content, 'utf-8');
+  try {
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch {}
+    throw e;
+  }
+}
+
+/**
+ * Kept as a manual escape hatch: nothing reads it automatically, but it is what stands
+ * between a bad patch and reinstalling VS Code. Documented in the README so it is findable
+ * when it is needed.
+ *
+ * `pristine` is the file with our patch already stripped, computed in memory by apply().
+ * Copying the file off disk instead used to snapshot whatever was there - which is the
+ * *old patch* in the one case the backup exists for: the backup had gone missing and an
+ * extension update triggered a re-patch. A backup that restores a patch restores nothing.
+ */
+function ensureBackup(target, stamp, pristine) {
   const bak = backupPath(target, stamp);
-  if (!fs.existsSync(bak)) fs.copyFileSync(target, bak);
+  if (!fs.existsSync(bak)) fs.writeFileSync(bak, pristine, 'utf-8');
 
   // Drop backups left behind by previous VS Code versions.
   const dir = path.dirname(target);
@@ -208,12 +230,16 @@ function apply(appRoot, script, stamp) {
     '</html>',
   ].join('\n');
 
-  if (!out.includes('</html>')) return { ok: false, reason: 'no </html> in workbench.html' };
-  out = out.replace('</html>', block);
+  // Sliced rather than String.replace, for two reasons: replace() takes the *first* closing
+  // tag, and the document's real one is the last; and a string replacement expands `$&` and
+  // friends, which is not something generated code should be scanned for.
+  const at = out.lastIndexOf('</html>');
+  if (at < 0) return { ok: false, reason: 'no </html> in workbench.html' };
+  out = out.slice(0, at) + block + out.slice(at + '</html>'.length);
 
   try {
-    ensureBackup(target, stamp);
-    fs.writeFileSync(target, out, 'utf-8');
+    ensureBackup(target, stamp, clean);
+    writeAtomic(target, out);
   } catch (e) {
     return { ok: false, reason: permissionError(e, appRoot, target) };
   }
@@ -233,7 +259,7 @@ function remove(appRoot, stamp) {
     if (info) {
       // Surgical, never a whole-file restore: strip our block and revert only the directives
       // this patch recorded. Anything else in the file was not ours to put back or take away.
-      fs.writeFileSync(target, revertCsp(stripBlock(html), info.cspAdded), 'utf-8');
+      writeAtomic(target, revertCsp(stripBlock(html), info.cspAdded));
     }
 
     const bak = backupPath(target, info ? info.stamp : stamp);
@@ -265,5 +291,5 @@ function isPatched(appRoot, stamp) {
 }
 
 module.exports = {
-  apply, remove, isPatched, writeState, paths, findWorkbenchHtml, MARKER,
+  apply, remove, isPatched, writeState, paths, findWorkbenchHtml, backupPath, MARKER,
 };

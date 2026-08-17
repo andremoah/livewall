@@ -17,8 +17,10 @@ const IMAGE_EXT = ['.gif', '.webp', '.apng', '.png', '.jpg', '.jpeg', '.avif'];
  */
 const DIRECTLY_SERVED = new Set(['.mp4', '.gif', '.webp', '.png', '.jpg', '.jpeg']);
 
+// `~\` as well as `~/`: a Windows user typing a home-relative path uses the separator their
+// shell and file explorer use, and the tilde was silently left literal.
 function expandHome(p) {
-  return p.startsWith('~/') ? path.join(os.homedir(), p.slice(2)) : p;
+  return /^~[\\/]/.test(p) ? path.join(os.homedir(), p.slice(2)) : p;
 }
 
 /**

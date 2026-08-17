@@ -3,11 +3,11 @@
   "displayName": "LiveWall",
   "description": "Animated video wallpapers behind your code, on their own compositor layer.",
   "publisher": "andremota",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "license": "MIT",
   "icon": "media/icon.png",
   "engines": {
-    "vscode": "^1.120.0"
+    "vscode": "^1.82.0"
   },
   "categories": [
     "Themes",
@@ -36,9 +36,16 @@
     "url": "https://buymeacoffee.com/andremota"
   },
   "main": "./src/extension.js",
-  "scripts": { "test": "node test/smoke.js" },
+  "scripts": {
+    "test": "node test/smoke.js",
+    "package": "npx --yes @vscode/vsce package",
+    "publish": "npx --yes @vscode/vsce publish"
+  },
   "activationEvents": [
     "onStartupFinished"
+  ],
+  "extensionKind": [
+    "ui"
   ],
   "capabilities": {
     "untrustedWorkspaces": {
@@ -85,6 +92,39 @@
           "scope": "application",
           "markdownDescription": "Absolute path to the wallpaper. Video (`.mp4`, `.webm`, `.mov`) or animated image (`.gif`, `.webp`, `.apng`); still images work too. `~` is supported. Easiest set via **LiveWall: Choose wallpaper...**"
         },
+        "livewall.mediaLight": {
+          "type": "string",
+          "default": "",
+          "scope": "application",
+          "markdownDescription": "Wallpaper to use while a **light** colour theme is active. Overrides `#livewall.media#`; leave empty to use the same wallpaper for both."
+        },
+        "livewall.mediaDark": {
+          "type": "string",
+          "default": "",
+          "scope": "application",
+          "markdownDescription": "Wallpaper to use while a **dark** colour theme is active. Overrides `#livewall.media#`; leave empty to use the same wallpaper for both."
+        },
+        "livewall.schedule": {
+          "type": "array",
+          "scope": "application",
+          "default": [],
+          "items": {
+            "type": "object",
+            "required": ["from", "media"],
+            "properties": {
+              "from": {
+                "type": "string",
+                "pattern": "^([01]?[0-9]|2[0-3]):[0-5][0-9]$",
+                "description": "Start time, 24-hour HH:MM."
+              },
+              "media": {
+                "type": "string",
+                "description": "Absolute path to the wallpaper for this slot. `~` is supported."
+              }
+            }
+          },
+          "markdownDescription": "Change wallpaper by time of day, e.g. `[{ \"from\": \"07:00\", \"media\": \"~/wall/day.mp4\" }, { \"from\": \"19:00\", \"media\": \"~/wall/night.mp4\" }]`. Each entry runs until the next one starts, wrapping past midnight. Takes precedence over `#livewall.media#` and the light/dark pair; ignored while `#livewall.shuffle#` is on."
+        },
         "livewall.library": {
           "type": "string",
           "default": "",
@@ -120,6 +160,7 @@
           "type": "number",
           "default": 0,
           "minimum": 0,
+          "maximum": 1440,
           "scope": "application",
           "markdownDescription": "Minutes between wallpapers when `#livewall.shuffle#` is on. `0` picks one at startup and keeps it."
         },
@@ -157,6 +198,34 @@
           "scope": "application",
           "description": "Darkening layer between the wallpaper and the UI. Higher = more readable text. This is the readability dial: unlike opacity, it is a fixed sheet, so a bright frame can never blow out your text."
         },
+        "livewall.blur": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 50,
+          "scope": "application",
+          "markdownDescription": "Blur applied to the wallpaper, in pixels. A few pixels kills fine detail that competes with text, without darkening anything the way `#livewall.scrim#` does."
+        },
+        "livewall.saturate": {
+          "type": "number",
+          "default": 1,
+          "minimum": 0,
+          "maximum": 3,
+          "scope": "application",
+          "markdownDescription": "Colour saturation of the wallpaper. `0` is greyscale, `1` is untouched. Useful when a colourful wallpaper fights your syntax highlighting."
+        },
+        "livewall.fit": {
+          "type": "string",
+          "default": "cover",
+          "enum": ["cover", "contain", "fill"],
+          "enumDescriptions": [
+            "Fill the window, cropping whatever does not fit.",
+            "Show the whole wallpaper, leaving bars where the aspect ratio differs.",
+            "Stretch to the window, ignoring the aspect ratio."
+          ],
+          "scope": "application",
+          "description": "How the wallpaper is sized against the window."
+        },
         "livewall.playbackRate": {
           "type": "number",
           "default": 1,
@@ -169,13 +238,19 @@
           "type": "boolean",
           "default": true,
           "scope": "application",
-          "markdownDescription": "Pause when the VS Code window loses focus. Focusing a webview panel does not count as losing focus. Video only - animated images cannot be paused."
+          "markdownDescription": "Pause when the VS Code window loses focus. Focusing a webview panel does not count as losing focus. Animated images hold their current frame."
+        },
+        "livewall.pauseOnBattery": {
+          "type": "boolean",
+          "default": false,
+          "scope": "application",
+          "markdownDescription": "Stop animating while the machine is running on battery, and resume when it is plugged back in. Animated images hold their current frame."
         },
         "livewall.respectReducedMotion": {
           "type": "boolean",
           "default": true,
           "scope": "application",
-          "markdownDescription": "Do not animate when the OS requests reduced motion (macOS: Settings > Accessibility > Display > Reduce motion). Set to `false` to animate anyway. Video only - animated images cannot be stopped."
+          "markdownDescription": "Do not animate when the OS requests reduced motion (macOS: Settings > Accessibility > Display > Reduce motion). Set to `false` to animate anyway. Takes effect as you change it, and animated images hold their current frame."
         }
       }
     }

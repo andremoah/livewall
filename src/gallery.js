@@ -18,7 +18,15 @@ const PROVIDERS = {
 function humanSize(bytes) {
   if (!bytes) return '';
   const mb = bytes / (1024 * 1024);
-  return mb >= 1 ? mb.toFixed(1) + ' MB' : Math.round(bytes / 1024) + ' KB';
+  if (mb >= 1) return mb.toFixed(1) + ' MB';
+  // A 500-byte file used to read as "0 KB".
+  return bytes >= 1024 ? Math.round(bytes / 1024) + ' KB' : bytes + ' B';
+}
+
+/** Providers that report no size would otherwise leave a dangling " · " on the card. */
+function subOf(kind, bytes) {
+  const size = humanSize(bytes);
+  return size ? `${kind} · ${size}` : kind;
 }
 
 function renderHtml(webview) {
@@ -208,6 +216,7 @@ function renderHtml(webview) {
 
 /** One gallery at a time - running the command twice used to open a second, competing panel. */
 let panel = null;
+let registered = false;
 
 function open(context, onPick) {
   const cfg = () => vscode.workspace.getConfiguration('livewall');
@@ -232,7 +241,12 @@ function open(context, onPick) {
   );
   const self = panel;
   self.onDidDispose(() => { if (panel === self) panel = null; });
-  context.subscriptions.push(self);
+  // One disposable for the life of the extension. Pushing the panel itself on every open
+  // grew `subscriptions` without bound, because dispose() never takes an entry back out.
+  if (!registered) {
+    registered = true;
+    context.subscriptions.push({ dispose: () => { if (panel) panel.dispose(); } });
+  }
   self.webview.html = renderHtml(self.webview);
 
   const post = (msg) => self.webview.postMessage(msg);
@@ -254,16 +268,24 @@ function open(context, onPick) {
     try {
       if (source === 'local') {
         const dir = (cfg().get('library') || '').trim();
-        const items = scanLibrary(dir).map((f) => ({
-          name: f.name,
-          sub: `${f.kind} · ${humanSize(f.bytes)}`,
-          kind: f.kind,
-          local: true,
-          localPath: f.path,
-          preview: self.webview.asWebviewUri(vscode.Uri.file(f.path)).toString(),
-          current: f.path === currentPath(),
-        }));
-        post({ type: 'results', items, note: dir || 'set livewall.library to a folder' });
+        // The search box was rendered and enabled for this source but silently ignored.
+        const needle = String(query || '').trim().toLowerCase();
+        const items = scanLibrary(dir)
+          .filter((f) => !needle || f.name.toLowerCase().includes(needle))
+          .map((f) => ({
+            name: f.name,
+            sub: subOf(f.kind, f.bytes),
+            kind: f.kind,
+            local: true,
+            localPath: f.path,
+            preview: self.webview.asWebviewUri(vscode.Uri.file(f.path)).toString(),
+            current: f.path === currentPath(),
+          }));
+        post({
+          type: 'results',
+          items,
+          note: needle ? `matching "${needle}" in ${dir}` : (dir || 'set livewall.library to a folder'),
+        });
         return;
       }
 
@@ -283,7 +305,7 @@ function open(context, onPick) {
         credit: PROVIDERS[source] ? PROVIDERS[source].credit : '',
         items: found.map((r) => ({
           name: r.author || r.label,
-          sub: r.author ? r.label : `${r.kind} · ${humanSize(r.bytes)}`,
+          sub: r.author ? r.label : subOf(r.kind, r.bytes),
           kind: r.kind,
           local: false,
           preview: r.thumb,

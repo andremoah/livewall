@@ -19,21 +19,87 @@ function num(value, fallback, min, max) {
   return Math.min(max, Math.max(min, n));
 }
 
+/** `object-fit` goes straight into CSS, so it is matched against a list rather than trusted. */
+const FITS = ['cover', 'contain', 'fill'];
+
 function readConfig() {
   const c = vscode.workspace.getConfiguration('livewall');
   return {
     enabled: c.get('enabled') !== false,
     // `video` is the pre-0.1 name, still honoured so existing settings keep working.
     media: String(c.get('media') || c.get('video') || '').trim(),
+    mediaLight: String(c.get('mediaLight') || '').trim(),
+    mediaDark: String(c.get('mediaDark') || '').trim(),
+    schedule: Array.isArray(c.get('schedule')) ? c.get('schedule') : [],
     library: String(c.get('library') || '').trim(),
     shuffle: !!c.get('shuffle'),
     rotateMinutes: num(c.get('rotateMinutes'), 0, 0, 60 * 24),
     opacity: num(c.get('opacity'), 0.35, 0, 1),
     scrim: num(c.get('scrim'), 0.55, 0, 1),
+    blur: num(c.get('blur'), 0, 0, 50),
+    saturate: num(c.get('saturate'), 1, 0, 3),
+    fit: FITS.includes(c.get('fit')) ? c.get('fit') : 'cover',
     playbackRate: num(c.get('playbackRate'), 1, 0.1, 4),
     pauseOnBlur: c.get('pauseOnBlur') !== false,
+    pauseOnBattery: !!c.get('pauseOnBattery'),
     respectReducedMotion: c.get('respectReducedMotion') !== false,
   };
+}
+
+/**
+ * Built here rather than in the renderer so the injected script stays dumb: it sets one
+ * custom property and never has to know what a filter is. Every input is already clamped by
+ * num(), which is what keeps a CSS function out of reach of a hand-edited settings file.
+ */
+function filterOf(cfg) {
+  const parts = [];
+  if (cfg.blur > 0) parts.push(`blur(${cfg.blur}px)`);
+  if (cfg.saturate !== 1) parts.push(`saturate(${cfg.saturate})`);
+  return parts.join(' ') || 'none';
+}
+
+/** `HH:MM` to minutes past midnight, or null if it is not a time at all. */
+function parseClock(s) {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(String(s == null ? '' : s).trim());
+  if (!m) return null;
+  const h = Number(m[1]);
+  const min = Number(m[2]);
+  if (h > 23 || min > 59) return null;
+  return h * 60 + min;
+}
+
+/**
+ * The entry whose start time is the most recent one still in the past wins, wrapping around
+ * midnight. Start times only: an end time is a second thing to keep in sync, and a list of
+ * starts already covers the whole day with no gaps to leave open by accident.
+ *
+ * @returns {string} the scheduled wallpaper, or '' when nothing is scheduled
+ */
+function scheduleMedia(schedule, now) {
+  const entries = (schedule || [])
+    .map((e) => ({ at: parseClock(e && e.from), media: String((e && e.media) || '').trim() }))
+    .filter((e) => e.at !== null && e.media)
+    .sort((a, b) => a.at - b.at);
+  if (!entries.length) return '';
+
+  const mins = now.getHours() * 60 + now.getMinutes();
+  // Before the first slot of the day, the one still running is yesterday's last.
+  let pick = entries[entries.length - 1];
+  for (const e of entries) if (e.at <= mins) pick = e;
+  return pick.media;
+}
+
+/** A light/dark entry overrides `media`, so one wallpaper stays the default for both. */
+function themeMedia(cfg) {
+  const kind = vscode.window.activeColorTheme.kind;
+  const light = kind === vscode.ColorThemeKind.Light
+    || kind === vscode.ColorThemeKind.HighContrastLight;
+  return (light ? cfg.mediaLight : cfg.mediaDark) || cfg.media;
+}
+
+/** Precedence: an explicit schedule beats the theme, which beats the plain setting. */
+function resolveMedia(cfg, now = new Date()) {
+  return scheduleMedia(cfg.schedule, now) || themeMedia(cfg);
 }
 
 async function offerReload(message) {
@@ -66,7 +132,7 @@ function buildPlaylist(cfg, stageDir) {
     if (items.length) return { items, unreachable };
   }
 
-  const abs = expandHome(cfg.media);
+  const abs = expandHome(resolveMedia(cfg));
   if (!abs) return { error: 'LiveWall: pick a wallpaper first (LiveWall: Choose wallpaper...).' };
   if (!fs.existsSync(abs)) return { error: `LiveWall: file not found - ${abs}` };
 
@@ -115,9 +181,12 @@ async function apply(context) {
     rotateMs: cfg.rotateMinutes * 60 * 1000,
     rate: cfg.playbackRate,
     pauseOnBlur: cfg.pauseOnBlur,
+    pauseOnBattery: cfg.pauseOnBattery,
     respectReducedMotion: cfg.respectReducedMotion,
     opacity: cfg.opacity,
     scrim: cfg.scrim,
+    filter: filterOf(cfg),
+    fit: cfg.fit,
   };
 
   // Written even when the playlist is empty: clearing the wallpaper setting has to clear the
@@ -141,11 +210,19 @@ async function apply(context) {
  * configuration listener runs on every slider tick, and per-file complaints there would be
  * a stream of toasts.
  */
+let lastReason = null;
+
 async function report(result, { silent, verbose, appliedMessage }) {
   if (!result.ok) {
-    if (!silent) vscode.window.showWarningMessage(result.reason);
+    // The configuration listener runs on every burst of slider ticks, and a wallpaper that
+    // has gone missing fails identically on each one. Say it once, not once per tick.
+    if (!silent && result.reason !== lastReason) {
+      lastReason = result.reason;
+      vscode.window.showWarningMessage(result.reason);
+    }
     return false;
   }
+  lastReason = null;
   if (verbose && result.unreachable && result.unreachable.length) {
     vscode.window.showWarningMessage(
       `LiveWall: could not prepare ${result.unreachable.length} file(s): ${result.unreachable.slice(0, 3).join(', ')}`
@@ -176,9 +253,10 @@ let status = null;
 function updateStatus() {
   if (!status) return;
   const cfg = readConfig();
+  const chosen = resolveMedia(cfg);
   const name = cfg.shuffle && cfg.library
     ? `${scanLibrary(cfg.library).length} wallpapers`
-    : (cfg.media ? path.basename(expandHome(cfg.media)) : 'no wallpaper set');
+    : (chosen ? path.basename(expandHome(chosen)) : 'no wallpaper set');
 
   status.text = cfg.enabled ? '$(sparkle)' : '$(circle-slash)';
   status.tooltip = cfg.enabled
@@ -242,7 +320,9 @@ function watchLibrary(context) {
         // The wallpaper is already live; only a fresh patch would need a reload.
         if (result.patched) {
           await offerReload('LiveWall: library changed, wallpaper re-applied. Reload to see it.');
-        } else if (added > 0) {
+        } else if (added > 0 && vscode.window.state.focused) {
+          // Every open window runs its own extension host and its own watcher, so one
+          // dropped file used to raise one toast per window. Only the focused one speaks.
           vscode.window.showInformationMessage(
             `LiveWall: ${added} new wallpaper${added > 1 ? 's' : ''} in your library.`
           );
@@ -254,11 +334,41 @@ function watchLibrary(context) {
   }
 }
 
+/* ---------------------------------------------------------------- schedule */
+
+let scheduleTimer = null;
+
+function stopSchedule() {
+  clearInterval(scheduleTimer);
+  scheduleTimer = null;
+}
+
+/**
+ * Polled once a minute rather than a timer aimed at the next boundary: a laptop asleep
+ * across the boundary never fires that timer and wakes up on the wrong wallpaper. Comparing
+ * the resolved file means the poll costs nothing until a slot actually changes.
+ */
+function watchSchedule(context) {
+  stopSchedule();
+  if (!readConfig().schedule.length) return;
+
+  let last = resolveMedia(readConfig());
+  scheduleTimer = setInterval(async () => {
+    const now = resolveMedia(readConfig());
+    if (now === last) return;
+    last = now;
+    await apply(context);
+    updateStatus();
+  }, 60 * 1000);
+}
+
 /* ---------------------------------------------------------------- activation */
 
 const LIVE_KEYS = [
-  'enabled', 'media', 'video', 'library', 'shuffle', 'rotateMinutes',
-  'opacity', 'scrim', 'playbackRate', 'pauseOnBlur', 'respectReducedMotion',
+  'enabled', 'media', 'video', 'mediaLight', 'mediaDark', 'schedule',
+  'library', 'shuffle', 'rotateMinutes',
+  'opacity', 'scrim', 'blur', 'saturate', 'fit',
+  'playbackRate', 'pauseOnBlur', 'pauseOnBattery', 'respectReducedMotion',
 ];
 
 function activate(context) {
@@ -266,7 +376,7 @@ function activate(context) {
   status.command = 'livewall.toggle';
   status.show();
   updateStatus();
-  context.subscriptions.push(status, { dispose: stopWatch });
+  context.subscriptions.push(status, { dispose: stopWatch }, { dispose: stopSchedule });
 
   context.subscriptions.push(
     vscode.commands.registerCommand('livewall.apply', async () => {
@@ -296,6 +406,16 @@ function activate(context) {
     )
   );
 
+  context.subscriptions.push(
+    // Only worth a round trip when the user actually set a per-theme wallpaper.
+    vscode.window.onDidChangeActiveColorTheme(async () => {
+      const cfg = readConfig();
+      if (!cfg.mediaLight && !cfg.mediaDark) return;
+      await report(await apply(context), { silent: true });
+      updateStatus();
+    })
+  );
+
   let pending = null;
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
@@ -303,6 +423,7 @@ function activate(context) {
       if (e.affectsConfiguration('livewall.library') || e.affectsConfiguration('livewall.shuffle')) {
         watchLibrary(context);
       }
+      if (e.affectsConfiguration('livewall.schedule')) watchSchedule(context);
       // Dragging a slider in the settings UI fires per keystroke; one write per burst is plenty.
       clearTimeout(pending);
       pending = setTimeout(async () => {
@@ -321,10 +442,17 @@ function activate(context) {
   });
 
   watchLibrary(context);
+  watchSchedule(context);
 }
 
 function deactivate() {
   stopWatch();
+  stopSchedule();
 }
 
-module.exports = { activate, deactivate };
+// The pure helpers are exported for the test suite: they hold the settings logic that used
+// to be reachable only by running VS Code.
+module.exports = {
+  activate, deactivate,
+  num, filterOf, parseClock, scheduleMedia, resolveMedia, readConfig, buildPlaylist,
+};

@@ -154,7 +154,11 @@ async function cached(dir, source, query, fetcher) {
 }
 
 function httpError(source, status) {
-  if (status === 401 || status === 400) return new Error('BAD_KEY');
+  // Only the keyed providers can have a key rejected. Wallhaven takes none, and its 400 is a
+  // malformed query - reporting that as a bad key sent people looking for a setting that
+  // does not exist for that source.
+  const keyed = source === 'pixabay' || source === 'pexels';
+  if (status === 401 || (status === 400 && keyed)) return new Error('BAD_KEY');
   if (status === 429) return new Error('RATE_LIMIT');
   return new Error(`${source} ${status}`);
 }
@@ -226,4 +230,4 @@ async function download(item, destDir, onProgress) {
   return dest;
 }
 
-module.exports = { SOURCES, search, parse, upstream, download, destinationFor };
+module.exports = { SOURCES, search, parse, upstream, download, destinationFor, httpError };

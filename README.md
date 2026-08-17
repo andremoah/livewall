@@ -14,13 +14,15 @@ rerasterize it, so typing latency is unaffected.
 
 ## Features
 
-- **Video and animated images** — `.mp4`, `.webm`, `.mov`, `.gif`, `.webp`, `.apng`. Still images work too.
+- **Video and animated images** — `.mp4`, `.webm`, `.mov`, `.m4v`, `.ogv`, `.gif`, `.webp`, `.apng`. Still images (`.png`, `.jpg`, `.avif`) work too.
 - **Built-in search** — browse Wallhaven, Pixabay and Pexels from inside the editor and apply with one click.
 - **Your own folder** — point LiveWall at a directory, drop files in, they appear automatically.
 - **Shuffle and rotation** — use the whole folder as a playlist and change wallpaper on a timer.
-- **Readability first** — a scrim layer guarantees a contrast floor no matter how bright the video gets.
-- **Battery aware** — pauses when the window loses focus or is hidden, and honours the OS reduced-motion setting.
-- **Live settings** — opacity, scrim, speed and the wallpaper itself change as you change them. No reload.
+- **Light and dark** — a different wallpaper per theme, switched the moment you switch theme.
+- **Scheduled** — change wallpaper by time of day.
+- **Readability first** — scrim, blur and saturation, so a busy wallpaper stops competing with your text.
+- **Battery aware** — stops when the window loses focus or is hidden, optionally while unplugged, and honours the OS reduced-motion setting. Animated images hold a frame; video pauses.
+- **Live settings** — every setting takes effect as you change it. No reload.
 - **Status bar toggle** — a ✨ next to the clock turns the wallpaper on or off in one click.
 
 ## Getting started
@@ -65,13 +67,20 @@ it back on costs one click. *Remove* undoes the patch itself.
 | --- | --- | --- |
 | `livewall.enabled` | `true` | Show the wallpaper. This is what the status bar toggles. |
 | `livewall.media` | `""` | Path to the current wallpaper. `~` is supported. |
+| `livewall.mediaLight` | `""` | Wallpaper for light themes. Overrides `media`. |
+| `livewall.mediaDark` | `""` | Wallpaper for dark themes. Overrides `media`. |
+| `livewall.schedule` | `[]` | Wallpaper by time of day. See below. |
 | `livewall.library` | `""` | Folder used by the gallery, watched for new files, and where downloads are saved. |
 | `livewall.shuffle` | `false` | Use the whole library as a playlist. |
 | `livewall.rotateMinutes` | `0` | Minutes between wallpapers. `0` keeps one per session. |
 | `livewall.opacity` | `0.35` | Opacity of the wallpaper layer. |
 | `livewall.scrim` | `0.55` | Darkening between wallpaper and UI. Raise it if text is hard to read. |
+| `livewall.blur` | `0` | Blur in pixels. Softens detail without darkening. |
+| `livewall.saturate` | `1` | Colour saturation. `0` is greyscale. |
+| `livewall.fit` | `cover` | `cover`, `contain` or `fill`. |
 | `livewall.playbackRate` | `1` | Video speed. Below `1` is calmer and cheaper. |
-| `livewall.pauseOnBlur` | `true` | Pause when the window loses focus. |
+| `livewall.pauseOnBlur` | `true` | Stop when the window loses focus. |
+| `livewall.pauseOnBattery` | `false` | Stop while running on battery. |
 | `livewall.respectReducedMotion` | `true` | Do not animate when the OS asks for reduced motion. |
 | `livewall.downloadSites` | *(4 sites)* | Sites opened by **Browse online…**. |
 | `livewall.pixabayApiKey` | `""` | Your free Pixabay key, for video search. |
@@ -87,7 +96,36 @@ All settings are application-scoped, so a workspace cannot change what LiveWall 
 
 `livewall.scrim` is the readability dial. Opacity fades the wallpaper toward whatever is
 behind it, which shifts with your theme; the scrim is a fixed sheet, so bright frames can
-never blow out your text.
+never blow out your text. `livewall.blur` is the other half of the same job: it removes the
+fine detail that competes with glyph edges without taking any brightness away, so a few
+pixels of blur often reads better than more scrim.
+
+### Choosing by theme and time
+
+`livewall.mediaLight` and `livewall.mediaDark` override `livewall.media` when a light or dark
+theme is active, so a single wallpaper stays the default for both and you only fill in the
+one that needs to differ. It switches as you switch theme.
+
+`livewall.schedule` changes wallpaper by time of day. Each entry runs until the next one
+starts, wrapping past midnight, so two entries cover the whole day:
+
+```jsonc
+"livewall.schedule": [
+  { "from": "07:00", "media": "~/wallpapers/day.mp4" },
+  { "from": "19:00", "media": "~/wallpapers/night.mp4" }
+]
+```
+
+Precedence is schedule, then the light/dark pair, then `livewall.media`. All three are
+ignored while `livewall.shuffle` is on — shuffle means the library *is* the wallpaper.
+
+### Stopping and starting
+
+Video pauses. An animated `.gif`, `.webp` or `.apng` has no playback API at all, so LiveWall
+captures the frame on screen and holds it — same effect, and it stops the decode loop, which
+matters most for exactly these files because they repaint on the main thread.
+
+That applies to `pauseOnBlur`, `pauseOnBattery`, a hidden window, and reduced motion alike.
 
 ## Video search keys
 
@@ -105,10 +143,14 @@ Keeping this cheap comes down to the source file:
 
 - **h264 `.mp4`, 1080p or less** — hardware decoded on every platform
 - **Short loops** — frame count drives memory more than resolution does
-- **Pre-bake any blur or darkening** into the file rather than applying filters at runtime
+- **Pre-bake heavy blur** into the file if you want a lot of it. `livewall.blur` is a live
+  GPU filter, which is cheap at a few pixels and less so at thirty; baking it in costs
+  nothing at runtime and is worth doing once you have settled on a look.
 
 A fullscreen animated `.gif` or `.webp` is the most expensive option, because the browser
-repaints the whole layer on the main thread. Video on its own layer is far cheaper.
+repaints the whole layer on the main thread. Video on its own layer is far cheaper. LiveWall
+freezes animated images whenever something would have paused a video, so the cost is at
+least confined to the time you are actually looking at the editor.
 
 `.mp4`, `.gif`, `.webp`, `.png` and `.jpg` load straight from wherever they live. VS Code's
 internal file protocol refuses to serve any other extension from an arbitrary folder, so
@@ -151,8 +193,12 @@ Worth knowing before you install:
   or `custom-ui-style`. They edit the same file and will fight over it. If one of them left
   a patch behind, LiveWall does not touch it — removing LiveWall reverts only its own
   changes, so a wallpaper from another extension will still be there afterwards.
-- **Webview panels stay opaque.** Panels like Copilot Chat run in separate renderer
-  processes; no stylesheet in the workbench document can reach inside them.
+- **Webview panel *contents* stay opaque.** LiveWall clears the background of the containers
+  those panels sit in, but a panel like Copilot Chat is an iframe running in a separate
+  renderer process, and no stylesheet in the workbench document reaches inside it.
+- **Remote work is unaffected.** LiveWall is a UI extension, so over Remote SSH, WSL or
+  Codespaces it keeps running on your own machine and patches your own installation. There is
+  nothing to patch on the remote, and it does not try.
 
 ## Troubleshooting
 
@@ -166,8 +212,11 @@ window.__livewall.state
 | --- | --- |
 | `playing` | Working. |
 | `paused: window blurred` | Expected while DevTools has focus. |
+| `paused: window hidden` | The window is minimised or fully covered. |
+| `paused: on battery` | `livewall.pauseOnBattery` is on and you are unplugged. |
 | `blocked: prefers-reduced-motion` | Your OS asks for reduced motion. Set `livewall.respectReducedMotion` to `false`. |
-| `image: always animating` | Current wallpaper is an image; pause controls do not apply. |
+| `image: animating` | Current wallpaper is an animated image and nothing is stopping it. |
+| `… (frozen frame)` | An animated image, held on a captured frame for the reason named. |
 | `off: disabled` | Turned off from the status bar. |
 | `off: no wallpaper set` | Nothing chosen yet. |
 | `waiting: no state file yet` | The configuration file is missing or unreadable. See `.lastStateError`. |

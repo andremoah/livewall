@@ -29,15 +29,19 @@
 const CSS = `
 html, body { background: transparent !important; }
 
-#livewall-media {
+/* #livewall-freeze is the canvas that stands in for an animated image while it is paused,
+   so it has to be laid out identically or pausing would visibly nudge the wallpaper. */
+#livewall-media,
+#livewall-freeze {
   position: fixed;
   inset: 0;
   width: 100%;
   height: 100%;
-  object-fit: cover;
+  object-fit: var(--livewall-fit, cover);
   z-index: 0;
   pointer-events: none;
   opacity: var(--livewall-opacity, 0.35);
+  filter: var(--livewall-filter, none);
   /* own compositor layer - keeps editor repaints off the wallpaper */
   will-change: transform;
   transform: translateZ(0);
@@ -142,13 +146,35 @@ function buildScript(opts) {
     var state = null;   // last configuration read from disk
     var video = null;   // null whenever the current item is an image
     var media = null;
+    var freeze = null;  // canvas holding the last frame of a paused animated image
     var index = 0;
     var rotTimer = null;
     var errors = 0;     // consecutive load failures, to stop a broken playlist spinning
 
+    // Live, not read once at boot: every other setting takes effect as it changes, and this
+    // one used to need a window reload, which is the opposite of what an accessibility
+    // setting should require.
     var reducedMotion = false;
     try {
-      reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      var mq = window.matchMedia('(prefers-reduced-motion: reduce)');
+      reducedMotion = mq.matches;
+      var onMotionChange = function (e) { reducedMotion = e.matches; sync(); };
+      if (mq.addEventListener) mq.addEventListener('change', onMotionChange);
+      else if (mq.addListener) mq.addListener(onMotionChange);
+    } catch (e) {}
+
+    // Discharging is the state worth reacting to: the wallpaper is pure decode cost and the
+    // first thing worth dropping on a train. Absent or refused, this stays false and the
+    // setting simply never fires.
+    var onBattery = false;
+    try {
+      if (typeof navigator !== 'undefined' && navigator.getBattery) {
+        navigator.getBattery().then(function (b) {
+          var read = function () { onBattery = !b.charging; sync(); };
+          b.addEventListener('chargingchange', read);
+          read();
+        }).catch(function () {});
+      }
     } catch (e) {}
 
     // Tracked from real blur/focus events rather than document.hasFocus(): during workbench
@@ -174,16 +200,22 @@ function buildScript(opts) {
       get enabled() { return enabled(); },
       get reducedMotion() { return reduced(); },
       get blurred() { return blurred; },
+      get onBattery() { return onBattery; },
+      get frozen() { return !!freeze; },
       get hidden() { return document.hidden; },
       get state() {
         if (!state) return 'waiting: no state file yet';
         if (!state.enabled) return 'off: disabled';
         if (!playlist().length) return 'off: no wallpaper set';
-        if (!video) return 'image: always animating';
-        return reduced() ? 'blocked: prefers-reduced-motion'
+        var why = reduced() ? 'blocked: prefers-reduced-motion'
           : document.hidden ? 'paused: window hidden'
           : (state.pauseOnBlur && blurred) ? 'paused: window blurred'
-          : video.paused ? 'paused: unknown' : 'playing';
+          : (state.pauseOnBattery && onBattery) ? 'paused: on battery'
+          : null;
+        // An animated image has no playback API, so it is held on a captured frame instead
+        // of paused - the reason it stopped is the same either way.
+        if (!video) return why ? why + ' (frozen frame)' : 'image: animating';
+        return why || (video.paused ? 'paused: unknown' : 'playing');
       },
     };
     window.__livewall = diag;
@@ -223,8 +255,43 @@ function buildScript(opts) {
       sync();
     }
 
+    function clearFreeze() {
+      if (freeze && freeze.parentNode) freeze.parentNode.removeChild(freeze);
+      freeze = null;
+      if (media && media.style) media.style.display = '';
+    }
+
+    /**
+     * An animated gif/webp/apng exposes no playback API - but drawing it to a canvas
+     * captures the frame that is on screen right now. Swapping the canvas in and hiding the
+     * <img> stops the decode loop outright, which matters more here than it does for video:
+     * an animated image repaints on the main thread, so it is the single most expensive
+     * wallpaper anyone can pick, and it was the one kind nothing could ever pause.
+     */
+    function freezeImage() {
+      if (!media || video || freeze) return;
+      var w = media.naturalWidth || 0;
+      var h = media.naturalHeight || 0;
+      if (!w || !h || !media.parentNode) return;   // not decoded yet; sync() will be back
+      try {
+        var c = document.createElement('canvas');
+        c.width = w;
+        c.height = h;
+        c.getContext('2d').drawImage(media, 0, 0, w, h);
+        c.id = 'livewall-freeze';
+        c.setAttribute('aria-hidden', 'true');
+        media.parentNode.insertBefore(c, media);
+        media.style.display = 'none';
+        freeze = c;
+      } catch (e) {
+        // Never worth breaking the wallpaper over: leave it animating.
+        diag.lastError = 'freeze failed: ' + String(e);
+      }
+    }
+
     function mount(item) {
       if (!item) return;
+      clearFreeze();
       var next = build(item);
       if (media && media.parentNode) media.parentNode.replaceChild(next, media);
       else document.body.insertBefore(next, document.body.firstChild);
@@ -245,6 +312,7 @@ function buildScript(opts) {
     }
 
     function unmount() {
+      clearFreeze();
       if (media && media.parentNode) media.parentNode.removeChild(media);
       // Drop the source too, or a hidden <video> keeps its decoder alive.
       if (media) { try { media.removeAttribute('src'); } catch (e) {} }
@@ -272,12 +340,22 @@ function buildScript(opts) {
       if (reduced()) return false;
       if (document.hidden) return false;
       if (state.pauseOnBlur && blurred) return false;
+      if (state.pauseOnBattery && onBattery) return false;
       return true;
     }
 
     function sync() {
-      if (!video) return;
-      if (!shouldPlay()) {
+      var play = shouldPlay();
+
+      // Animated images have no play()/pause(); holding a captured frame is the equivalent.
+      if (!video) {
+        if (play) clearFreeze();
+        else freezeImage();
+        return;
+      }
+
+      clearFreeze();
+      if (!play) {
         video.pause();
         return;
       }
@@ -327,6 +405,9 @@ function buildScript(opts) {
       if (root && root.style && root.style.setProperty) {
         root.style.setProperty('--livewall-opacity', String(next.opacity));
         root.style.setProperty('--livewall-scrim', String(next.scrim));
+        // Assembled extension-side from clamped numbers, so nothing arbitrary lands in CSS.
+        root.style.setProperty('--livewall-filter', String(next.filter || 'none'));
+        root.style.setProperty('--livewall-fit', String(next.fit || 'cover'));
       }
       scrim.style.display = enabled() ? '' : 'none';
 
