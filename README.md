@@ -143,6 +143,8 @@ Keeping this cheap comes down to the source file:
 
 - **h264 `.mp4`, 1080p or less** — hardware decoded on every platform
 - **Short loops** — frame count drives memory more than resolution does
+- **Small files** — on VS Code 1.139, which cannot stream local video, each video is held in
+  memory while it plays, so a 30 MB clip costs about 30 MB of RAM
 - **Pre-bake heavy blur** into the file if you want a lot of it. `livewall.blur` is a live
   GPU filter, which is cheap at a few pixels and less so at thirty; baking it in costs
   nothing at runtime and is worth doing once you have settled on a look.
@@ -202,7 +204,8 @@ Worth knowing before you install:
 
 ## Troubleshooting
 
-Open **Help → Toggle Developer Tools** and check:
+Open the developer tools (`Cmd+Option+I` on macOS, `Ctrl+Shift+I` elsewhere, or
+**Developer: Toggle Developer Tools** from the Command Palette) and check:
 
 ```js
 window.__livewall.state
@@ -220,7 +223,7 @@ window.__livewall.state
 | `off: disabled` | Turned off from the status bar. |
 | `off: no wallpaper set` | Nothing chosen yet. |
 | `waiting: no state file yet` | The configuration file is missing or unreadable. See `.lastStateError`. |
-| `paused: unknown` | A bug. Please open an issue. |
+| `paused: unknown` | The video failed to load or play. See `.lastError` and `.playRejected`, and open an issue if they do not explain it. |
 
 `window.__livewall.lastError` and `.playRejected` hold the last media failure;
 `.lastStateError` holds the last failure to read the configuration file.

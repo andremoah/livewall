@@ -93,6 +93,9 @@ function revertCsp(html, cspAdded) {
   if (cspAdded.includes('media')) {
     out = editDirective(out, MEDIA_SRC, (b) => b.replace(/ vscode-file:/, '')).html;
   }
+  if (cspAdded.includes('blob')) {
+    out = editDirective(out, MEDIA_SRC, (b) => b.replace(/ blob:/, '')).html;
+  }
   return out;
 }
 
@@ -102,6 +105,8 @@ function revertCsp(html, cspAdded) {
  * the scheme explicitly anyway because it costs nothing and removes all doubt.
  *
  * `script-src` needs 'unsafe-inline' for our injected <script> to run at all.
+ *
+ * `media-src` also needs `blob:`: videos are fetched whole and played from an object URL.
  *
  * `connect-src` needs nothing: the state file is fetched from the same origin, which
  * `connect-src 'self'` already covers.
@@ -122,6 +127,12 @@ function relaxCsp(html) {
     b.includes('vscode-file:') ? b : b.replace(/'self'/, `'self' vscode-file:`));
   out = r.html;
   if (r.changed) added.push('media');
+
+  // Videos play from a blob: URL, because VS Code 1.139's vscode-file: handler ignores Range.
+  r = editDirective(out, MEDIA_SRC, (b) =>
+    /(^|\s)blob:/.test(b) ? b : b.replace(/(\S)(\s*)$/, '$1 blob:$2'));
+  out = r.html;
+  if (r.changed) added.push('blob');
 
   return { html: out, added };
 }

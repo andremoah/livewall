@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.2.2
+
+Fixes for VS Code 1.139. If your wallpaper disappeared after updating VS Code, this is why.
+
+### Fixed
+
+- **Videos stopped playing.** VS Code 1.139's `vscode-file:` handler ignores byte-range
+  requests, and `<video>` reports the whole-file answer as a format error. On that error the
+  video is now fetched whole and played from a `blob:` URL instead, which holds it in memory
+  while it plays. Older VS Code versions, where streaming still works, never take that path
+  and use no extra memory. Images are unaffected. The CSP patch adds `blob:` to `media-src`
+  for this, and removes it again on uninstall.
+- **The new "modern UI" covered the wallpaper.** `workbench.experimental.modernUI`, on by
+  default in 1.139, paints an opaque shell behind the whole layout and opaque sidebar and
+  panel panes marked `!important`. Those layers are now transparent too.
+
 ## 1.2.1
 
 Listing metadata only — no functional change, and no reason to update if you already have

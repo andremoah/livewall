@@ -254,11 +254,14 @@ function stateOf(over) {
 /** Serves whatever `box.state` currently holds, the way the real state file does. */
 function run(script, box, opts) {
   const dom = fakeDom(opts);
-  const fetchImpl = () => Promise.resolve({
-    ok: box.state !== null,
-    status: box.state === null ? 404 : 200,
-    json: () => Promise.resolve(box.state),
-  });
+  // Media requests get a body; everything else is the state file.
+  const fetchImpl = (url) => (opts && opts.fetch && opts.fetch(url)) || (/\.(mp4|webm)$/.test(url)
+    ? Promise.resolve({ ok: true, status: 200, blob: () => Promise.resolve(new Blob(['x'])) })
+    : Promise.resolve({
+      ok: box.state !== null,
+      status: box.state === null ? 404 : 200,
+      json: () => Promise.resolve(box.state),
+    }));
   let err = null;
   try {
     new Function(
@@ -304,6 +307,72 @@ async function runtimeTests() {
     check(`${kind} script does not create the other element`,
       !tags.includes(kind === 'video' ? 'IMG' : 'VIDEO'));
     check(`${kind} diag reports the kind`, r.diag() && r.diag().kind === kind);
+    check(`${kind} loads straight from the file url`,
+      r.diag().media.src === 'vscode-file://vscode-app' + file);
+  }
+
+  // Regression: VS Code 1.139 ignores Range on vscode-file:, which <video> reports as a format
+  // error. That error retries the same item from a blob:, and only a blob that actually plays
+  // switches later videos to blob: up front - older VS Code keeps streaming from the file.
+  const formatError = (v) => { v.error = { code: 4, message: 'Format error' }; v.fire('error'); };
+  {
+    const box = { state: stateOf({
+      playlist: [
+        { src: 'vscode-file://vscode-app/tmp/a.mp4', kind: 'video' },
+        { src: 'vscode-file://vscode-app/tmp/b.mp4', kind: 'video' },
+      ],
+    }) };
+    const r = run(script, box);
+    await tick();
+    const diag = r.diag();
+    check('a video starts on the file url', diag.source === 'file');
+
+    formatError(diag.video);
+    await tick(); await tick(); await tick();
+    check('a format error falls back to a blob: url', String(diag.media.src).startsWith('blob:'));
+    check('the fallback keeps the same item', diag.index === 0);
+    check('the fallback is not counted as a failure', diag.lastError === null);
+
+    diag.video.fire('loadeddata');
+    diag.rotate();
+    await tick(); await tick(); await tick();
+    check('once a blob has played, the next video skips the file url',
+      String(diag.media.src).startsWith('blob:'));
+  }
+
+  // A file that is genuinely broken fails as a blob too, and must not flip later videos to blob.
+  {
+    const box = { state: stateOf({
+      playlist: [
+        { src: 'vscode-file://vscode-app/tmp/bad.mp4', kind: 'video' },
+        { src: 'vscode-file://vscode-app/tmp/b.mp4', kind: 'video' },
+      ],
+    }) };
+    const r = run(script, box);
+    await tick();
+    const diag = r.diag();
+    formatError(diag.video);
+    await tick(); await tick(); await tick();
+    formatError(diag.video);   // the blob copy is no better
+    check('a file broken both ways rotates away', diag.index === 1);
+    check('and the next video still starts on the file url', diag.source === 'file');
+  }
+
+  // A fetch that fails has to count as a load failure, or a missing file strands the wallpaper.
+  {
+    const box = { state: stateOf({
+      playlist: [
+        { src: 'vscode-file://vscode-app/tmp/gone.mp4', kind: 'video' },
+        { src: 'vscode-file://vscode-app/tmp/b.webp', kind: 'image' },
+      ],
+    }) };
+    const r = run(script, box, { fetch: (url) => /gone/.test(url)
+      ? Promise.resolve({ ok: false, status: 404 }) : null });
+    await tick();
+    formatError(r.diag().video);
+    await tick(); await tick(); await tick();
+    check('a failed media fetch is reported', /fetch failed/.test(String(r.diag().lastError)));
+    check('a failed media fetch rotates away', r.diag().index === 1);
   }
 
   // Opacity and scrim ride in as custom properties, which is what makes them live.
@@ -507,6 +576,7 @@ function pristine(html) {
     .replace(/\n?<!-- livewall-start[\s\S]*?<!-- livewall-end -->/g, '')
     .replace(/\n?<!-- vscode-background-start[\s\S]*?<!-- vscode-background-end -->/g, '')
     .replace(/script-src 'unsafe-inline'/, 'script-src')
+    .replace(/(media-src\s+'self'\s+vscode-file:)\s+blob:/, '$1')
     .replace(/(media-src\s+'self')\s+vscode-file:/, '$1');
 }
 
@@ -520,7 +590,8 @@ async function patcherTests(label, original) {
 
   let html = fs.readFileSync(target, 'utf-8');
   check('start marker present', new RegExp(`<!-- livewall-start ${STAMP} csp=\\S+ -->`).test(html));
-  check('start marker records the CSP directives it relaxed', /csp=script\+media/.test(html));
+  check('start marker records the CSP directives it relaxed', /csp=script\+media\+blob /.test(html));
+  check('media-src got blob:', /media-src\s+'self'\s+vscode-file:\s+blob:/.test(html));
   check('end marker present', html.includes('<!-- livewall-end -->'));
   check('closing </html> preserved', html.trimEnd().endsWith('</html>'));
   check("script-src got 'unsafe-inline'", /script-src\s+'unsafe-inline'/.test(html));
@@ -547,6 +618,7 @@ async function patcherTests(label, original) {
   check('exactly 1 block after 2x apply', (html.match(/livewall-start/g) || []).length === 1);
   check("exactly 1 'unsafe-inline'", (html.match(/script-src\s+'unsafe-inline'/g) || []).length === 1);
   check('exactly 1 vscode-file:', (html.match(/media-src\s+'self'\s+vscode-file:/g) || []).length === 1);
+  check('exactly 1 blob: in media-src', (html.match(/media-src[^;]*/)[0].match(/blob:/g) || []).length === 1);
 
   const r2 = patcher.remove(sandbox, STAMP);
   check('remove() ok: ' + (r2.ok ? 'yes' : r2.reason), r2.ok);
@@ -568,7 +640,7 @@ async function patcherTests(label, original) {
     check('foreign block survives our apply', patched.includes('other-ext-start'));
     check('does not double up an already relaxed directive',
       (patched.match(/script-src 'unsafe-inline'/g) || []).length === 1);
-    check('only the directive we did relax is recorded', /csp=media -->/.test(patched));
+    check('only the directive we did relax is recorded', /csp=media\+blob -->/.test(patched));
 
     // Re-applying (picking a different wallpaper) must not change what removal will revert.
     patcher.apply(sandbox, script, STAMP);

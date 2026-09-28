@@ -92,6 +92,17 @@ html, body { background: transparent !important; }
   background-color: transparent !important;
 }
 
+/* VS Code 1.139 "modern UI" (workbench.experimental.modernUI, on by default). The grid view
+   gets an opaque shell background that covers the whole window, and the pane rules carry
+   their own !important at higher specificity than the list above - hence the :is() here,
+   which has to out-rank .modern-ui :is(.part.sidebar,...) .monaco-pane-view .pane. */
+.monaco-workbench.floating-panels > .monaco-grid-view,
+.monaco-workbench.modern-ui :is(.part.sidebar, .part.auxiliarybar, .part.panel) .monaco-pane-view .pane,
+.monaco-workbench.modern-ui :is(.part.sidebar, .part.auxiliarybar, .part.panel) .monaco-pane-view .pane > .pane-header,
+.monaco-workbench.modern-ui .part.editor .title.tabs > .tabs-and-actions-container {
+  background-color: transparent !important;
+}
+
 /* The empty-editor VS Code logo is designed to sit invisibly against a flat editor
    background. Over a wallpaper it reads as a stray watermark. */
 .monaco-workbench .editor-group-watermark .letterpress {
@@ -202,6 +213,7 @@ function buildScript(opts) {
       get blurred() { return blurred; },
       get onBattery() { return onBattery; },
       get frozen() { return !!freeze; },
+      get source() { return !video ? 'file' : blobUrl ? 'blob' : streamBroken ? 'loading blob' : 'file'; },
       get hidden() { return document.hidden; },
       get state() {
         if (!state) return 'waiting: no state file yet';
@@ -240,8 +252,44 @@ function buildScript(opts) {
       }
       el.id = 'livewall-media';
       el.setAttribute('aria-hidden', 'true');
-      el.src = item.src;
+      if (item.kind === 'video' && streamBroken) { retried = el; loadVideo(el, item.src); }
+      else el.src = item.src;
       return el;
+    }
+
+    /**
+     * VS Code 1.139's vscode-file: handler ignores Range and answers 200 with no length, and
+     * <video> reports that as a format error. A plain fetch still gets the whole body, and a
+     * blob: URL serves ranges from memory - at the cost of holding the file in RAM.
+     *
+     * So the file URL is tried first, and blob: is the fallback for a format error. Once a
+     * blob has actually played, streaming is known broken here and later videos skip the
+     * failed attempt. A file that is genuinely corrupt fails both ways and never sets it.
+     */
+    var blobUrl = null;
+    var streamBroken = false;
+    var retried = null;   // the element already sent to loadVideo(), so it is never retried twice
+    function dropBlob() {
+      if (blobUrl) { try { URL.revokeObjectURL(blobUrl); } catch (e) {} }
+      blobUrl = null;
+    }
+    function loadVideo(el, src) {
+      fetch(src)
+        .then(function (res) {
+          if (!res.ok) throw new Error('media ' + res.status);
+          return res.blob();
+        })
+        .then(function (b) {
+          if (media !== el) return;   // replaced while loading
+          dropBlob();
+          blobUrl = URL.createObjectURL(b);
+          el.src = blobUrl;
+        })
+        .catch(function (err) {
+          if (media !== el) return;
+          onMediaError();
+          diag.lastError = 'fetch failed: ' + String(err);   // after, or it is overwritten
+        });
     }
 
     function applyRate() {
@@ -250,6 +298,7 @@ function buildScript(opts) {
     }
 
     function onLoaded() {
+      if (blobUrl) streamBroken = true;
       errors = 0;
       applyRate();
       sync();
@@ -292,10 +341,12 @@ function buildScript(opts) {
     function mount(item) {
       if (!item) return;
       clearFreeze();
+      dropBlob();
+      var prev = media;
       var next = build(item);
-      if (media && media.parentNode) media.parentNode.replaceChild(next, media);
+      media = next;   // before loadVideo() resolves, so it can tell it is still current
+      if (prev && prev.parentNode) prev.parentNode.replaceChild(next, prev);
       else document.body.insertBefore(next, document.body.firstChild);
-      media = next;
 
       if (video) {
         video.addEventListener('loadedmetadata', applyRate);
@@ -316,6 +367,7 @@ function buildScript(opts) {
       if (media && media.parentNode) media.parentNode.removeChild(media);
       // Drop the source too, or a hidden <video> keeps its decoder alive.
       if (media) { try { media.removeAttribute('src'); } catch (e) {} }
+      dropBlob();
       media = null;
       video = null;
       diag.media = null;
@@ -370,6 +422,12 @@ function buildScript(opts) {
 
     function onMediaError() {
       var item = playlist()[index] || {};
+      // MEDIA_ERR_SRC_NOT_SUPPORTED on the file URL: retry the same item from memory.
+      if (video && retried !== video && video.error && video.error.code === 4 && item.src) {
+        retried = video;
+        loadVideo(video, item.src);
+        return;
+      }
       diag.lastError = (video && video.error)
         ? video.error.code + ' ' + video.error.message
         : 'failed to load';

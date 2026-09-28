@@ -3,7 +3,7 @@
   "displayName": "LiveWall — Wallpapers & Backgrounds",
   "description": "Animated video and GIF wallpapers behind your code — smooth, readable, and they pause themselves when you look away.",
   "publisher": "andremota",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "license": "MIT",
   "icon": "media/icon.png",
   "engines": {
